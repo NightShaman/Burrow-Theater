@@ -31,7 +31,7 @@ test('activation exposes only SOUL role and conversation routes with no agent to
 test('bootstrap returns configured models, operator identity, default SOUL role, and conversations', async () => {
   const f = fixture(); await activate(f.context); const result = await f.routes.get('GET /bootstrap')(req());
   assert.equal(result.status, 200); assert.deepEqual(result.body.models, f.models); assert.equal(result.body.operator.name, 'Rob');
-  assert.equal(result.body.roles[0].name, 'The House Goblin'); assert.match(result.body.roles[0].soul, /# SOUL/); assert.deepEqual(result.body.conversations, []);
+  assert.equal(result.body.roles[0].name, 'The House Goblin'); assert.match(result.body.roles[0].soul, /# SOUL/); assert.equal(result.body.roles[0].allowForgeImages, false); assert.deepEqual(result.body.conversations, []);
 });
 
 test('auth context protects Theater state when Burrow authentication is enabled', async () => {
@@ -42,9 +42,9 @@ test('auth context protects Theater state when Burrow authentication is enabled'
 
 test('roles are name plus SOUL markdown and cannot be deleted while in use', async () => {
   const f = fixture(); await activate(f.context);
-  const made = await f.routes.get('POST /roles')(req({ name: 'Mara', soul: '# SOUL\nA dangerous librarian.' }));
-  assert.equal(made.status, 201); assert.equal(made.body.role.name, 'Mara'); assert.match(made.body.role.soul, /dangerous librarian/);
-  const updated = await f.routes.get('PUT /roles/:id')(req({ name: 'Mara', soul: '# SOUL\nA very dangerous librarian.' }, { id: made.body.role.id }));
+  const made = await f.routes.get('POST /roles')(req({ name: 'Mara', soul: '# SOUL\nA dangerous librarian.', allowForgeImages: true }));
+  assert.equal(made.status, 201); assert.equal(made.body.role.name, 'Mara'); assert.equal(made.body.role.allowForgeImages, true); assert.match(made.body.role.soul, /dangerous librarian/);
+  const updated = await f.routes.get('PUT /roles/:id')(req({ name: 'Mara', soul: '# SOUL\nA very dangerous librarian.', allowForgeImages: false }, { id: made.body.role.id }));
   assert.match(updated.body.role.soul, /very dangerous/);
   await createConversation(f, made.body.role.id);
   assert.equal((await f.routes.get('DELETE /roles/:id')(req({}, { id: made.body.role.id }))).status, 409);
@@ -175,17 +175,26 @@ test('overlapping turns cannot overwrite a completed turn', async () => {
 });
 
 
-test('Forge images default off and the switch persists per conversation', async () => {
+test('Forge permission defaults off, persists per role, and legacy conversation permission is ignored', async () => {
   const f = fixture(); await activate(f.context); const created = await createConversation(f); const conversationId = created.body.conversation.id;
-  assert.equal(created.body.conversation.allowForgeImages, false);
-  assert.equal((await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: 'yes' }, { id: conversationId }))).status, 400);
-  const updated = await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id: conversationId }));
-  assert.equal(updated.body.conversation.allowForgeImages, true); assert.equal(f.settings.get('conversations')[0].allowForgeImages, true);
+  assert.equal(Object.hasOwn(created.body.conversation, 'allowForgeImages'), false);
+  assert.equal((await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id: conversationId }))).status, 400);
+  assert.equal((await f.routes.get('PUT /roles/:id')(req({ allowForgeImages: 'yes' }, { id: 'house-goblin' }))).status, 400);
+  const updated = await f.routes.get('PUT /roles/:id')(req({ allowForgeImages: true }, { id: 'house-goblin' }));
+  assert.equal(updated.body.role.allowForgeImages, true); assert.equal(f.settings.get('roles')[0].allowForgeImages, true);
+  const stored = f.settings.get('conversations'); stored[0].allowForgeImages = true; f.settings.set('conversations', stored);
+  await f.routes.get('PUT /roles/:id')(req({ allowForgeImages: false }, { id: 'house-goblin' }));
+  const bootstrap = await f.routes.get('GET /bootstrap')(req());
+  assert.equal(Object.hasOwn(bootstrap.body.conversations[0], 'allowForgeImages'), false);
 });
 
-test('enabled turns durably return pending images before idempotent Forge enqueue and hide directives from prose', async () => {
-  const f = fixture(); await activate(f.context); const created = await createConversation(f); const conversationId = created.body.conversation.id;
-  await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id: conversationId }));
+async function enableRoleImages(f, roleId = 'house-goblin') {
+  const result = await f.routes.get('PUT /roles/:id')(req({ allowForgeImages: true }, { id: roleId }));
+  assert.equal(result.status, 200);
+}
+
+test('enabled role turns durably return pending images before idempotent Forge enqueue and hide directives from prose', async () => {
+  const f = fixture(); await activate(f.context); await enableRoleImages(f); const created = await createConversation(f); const conversationId = created.body.conversation.id;
   f.context.models.generateText = async input => (f.generations.push(input), { text: 'Behold the stage.\n<!-- BURROW_FORGE_IMAGE {"prompt":"A moonlit goblin theater, wide shot"} -->' });
   f.context.forge.images.create = async () => new Promise(() => {});
   const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Show me.' }, { id: conversationId }));
@@ -197,35 +206,34 @@ test('enabled turns durably return pending images before idempotent Forge enqueu
   const reconciled = await f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id: conversationId }));
   const completed = reconciled.body.conversation.messages[2]; assert.equal(completed.status, 'completed'); assert.equal(completed.previewUrl, '/api/forge/jobs/job-1/artifacts/a1');
   assert.deepEqual(f.forgeCreates, [{ prompt: 'A moonlit goblin theater, wide shot', idempotencyKey: `message-${image.id}` }]);
-  assert.equal(f.settings.get('conversations')[0].messages[2].status, 'completed');
 });
 
-test('invalid image directives remain prose and do not create jobs', async () => {
+test('disabled roles leave image directives as prose and do not create jobs', async () => {
   const f = fixture(); await activate(f.context); const created = await createConversation(f); const id = created.body.conversation.id;
-  await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id }));
-  f.context.models.generateText = async () => ({ text: 'Nope\n<!-- BURROW_FORGE_IMAGE {"prompt":"x","model":"secret"} -->' });
+  f.context.models.generateText = async input => (f.generations.push(input), { text: 'Nope\n<!-- BURROW_FORGE_IMAGE {"prompt":"x"} -->' });
   const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Hello' }, { id }));
-  assert.equal(turn.body.conversation.messages.length, 2); assert.match(turn.body.conversation.messages[1].content, /FORGE_IMAGE/); assert.equal(f.forgeCreates.length, 0);
+  assert.equal(turn.body.conversation.messages.length, 2); assert.match(turn.body.conversation.messages[1].content, /FORGE_IMAGE/); assert.doesNotMatch(f.generations[0].prompt, /# Optional image direction/); assert.equal(f.forgeCreates.length, 0);
 });
 
-test('group image directives preserve role attribution and are excluded from later role prompts', async () => {
-  const f = await groupFixture(); const created = await groupCreate(f, { allowForgeImages: true }); let call = 0;
-  f.context.models.generateText = async input => { f.generations.push(input); return call++ === 0 ? { text: 'First.\n<!-- BURROW_FORGE_IMAGE {"prompt":"First role scene"} -->' } : { text: 'Second.' }; };
+test('mixed groups honor each role permission independently and reserve only enabled image capacity', async () => {
+  const f = await groupFixture(); await enableRoleImages(f, f.roleIds[0]); const created = await groupCreate(f); let call = 0;
+  f.context.models.generateText = async input => { f.generations.push(input); return call++ === 0 ? { text: 'First.\n<!-- BURROW_FORGE_IMAGE {"prompt":"First role scene"} -->' } : { text: 'Second.\n<!-- BURROW_FORGE_IMAGE {"prompt":"Denied second scene"} -->' }; };
   const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Perform' }, { id: created.body.conversation.id }));
-  assert.equal(turn.status, 200); const image = turn.body.conversation.messages.find(message => message.type === 'forge_image'); assert.equal(image.roleId, f.roleIds[0]);
-  assert.doesNotMatch(f.generations[1].prompt, /First role scene|BURROW_FORGE_IMAGE \{"prompt":"First role scene/); assert.match(f.generations[1].prompt, /First\./);
+  assert.equal(turn.status, 200); const images = turn.body.conversation.messages.filter(message => message.type === 'forge_image'); assert.equal(images.length, 1); assert.equal(images[0].roleId, f.roleIds[0]);
+  assert.match(f.generations[0].prompt, /BURROW_FORGE_IMAGE/); assert.doesNotMatch(f.generations[1].prompt, /# Optional image direction/); assert.match(turn.body.conversation.messages.at(-1).content, /Denied second scene/);
+  assert.doesNotMatch(f.generations[1].prompt, /First role scene/); assert.match(f.generations[1].prompt, /First\./);
+  const stored = f.settings.get('conversations'); stored[0].messages = Array.from({ length: theaterContract.MAX.transcript - 4 }, (_, i) => ({ id: `m${i}`, role: 'user', content: 'Hi' })); f.settings.set('conversations', stored);
+  assert.equal((await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Fits exactly' }, { id: created.body.conversation.id }))).status, 200);
 });
 
 test('failed Forge creation and reload reconciliation persist attributed terminal state', async () => {
-  const f = fixture(); await activate(f.context); const created = await createConversation(f); const id = created.body.conversation.id;
-  await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id }));
+  const f = fixture(); await activate(f.context); await enableRoleImages(f); const created = await createConversation(f); const id = created.body.conversation.id;
   f.context.models.generateText = async () => ({ text: 'Scene.\n<!-- BURROW_FORGE_IMAGE {"prompt":"A scene"} -->' });
   const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Hello' }, { id })); const image = turn.body.conversation.messages[2];
-  assert.equal(image.status, 'pending'); assert.equal(image.jobId, null); assert.equal(image.roleId, 'house-goblin'); assert.equal(f.settings.get('conversations')[0].messages[2].status, 'pending');
+  assert.equal(image.status, 'pending'); assert.equal(image.jobId, null); assert.equal(image.roleId, 'house-goblin');
   f.context.forge.images.create = async input => { f.forgeCreates.push(input); const job = { id: 'job-recovered', status: 'failed', artifacts: [], error: 'provider_failed' }; f.forgeJobs.set(job.id, job); return { job, replayed: false }; };
   const retried = await f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id })); assert.equal(retried.body.conversation.messages[2].status, 'failed'); assert.equal(retried.body.conversation.messages[2].jobId, 'job-recovered');
 });
-
 
 test('a stale enqueue failure cannot erase a job receipt persisted by another reconcile', async () => {
   const f = fixture(); await activate(f.context); const created = await createConversation(f); const id = created.body.conversation.id;

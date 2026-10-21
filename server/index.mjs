@@ -19,7 +19,8 @@ Speak directly and conversationally. Treat fictional actions as real inside the 
 Stay in character. Do not audit, retract, or apologize for imaginary actions merely because no tool was used.`,
   avatar: '🎭',
   createdAt: '2026-10-21T00:00:00.000Z',
-  updatedAt: '2026-10-21T00:00:00.000Z'
+  updatedAt: '2026-10-21T00:00:00.000Z',
+  allowForgeImages: false
 });
 
 function plain(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
@@ -45,15 +46,20 @@ function errorResponse(error, logger) {
 function now() { return new Date().toISOString(); }
 function clone(value) { return structuredClone(value); }
 function validateRole(body, existing = {}) {
-  if (!plain(body) || Object.keys(body).some((key) => !['name', 'soul'].includes(key))) fail('role_invalid');
+  if (!plain(body) || Object.keys(body).some((key) => !['name', 'soul', 'allowForgeImages'].includes(key))) fail('role_invalid');
+  const allowForgeImages = body.allowForgeImages === undefined ? existing.allowForgeImages === true : body.allowForgeImages;
+  if (typeof allowForgeImages !== 'boolean') fail('allow_forge_images_invalid');
   return {
     name: text(body.name ?? existing.name, 'name', MAX.name, { required: true }),
-    soul: text(body.soul ?? existing.soul, 'soul', MAX.soul, { required: true })
+    soul: text(body.soul ?? existing.soul, 'soul', MAX.soul, { required: true }),
+    allowForgeImages
   };
 }
+function normalizeRole(role) { return { ...role, allowForgeImages: role.allowForgeImages === true }; }
 function normalizeConversation(conversation) {
+  const { allowForgeImages: _legacyForgePermission, ...rest } = conversation;
   const roleIds = Array.isArray(conversation.roleIds) && conversation.roleIds.length ? conversation.roleIds : [conversation.roleId];
-  return { ...conversation, allowForgeImages: conversation.allowForgeImages === true, roleIds, roleId: roleIds[0], messages: (conversation.messages || []).map((message) =>
+  return { ...rest, roleIds, roleId: roleIds[0], messages: (conversation.messages || []).map((message) =>
     message.role === 'assistant' && !message.roleId ? { ...message, roleId: conversation.roleId || roleIds[0] } : message) };
 }
 function parseImageDirective(value) {
@@ -76,7 +82,7 @@ function projectImageJob(message, job) {
   return { ...message, status: completed ? 'completed' : pending ? 'pending' : 'failed', jobId: job?.id || message.jobId || null, previewUrl: completed ? job.artifacts.find((artifact) => artifact?.previewUrl).previewUrl : null, error: !completed && !pending ? (job?.error || 'Image generation failed.') : null, updatedAt: now() };
 }
 function validateConversation(body, existing = {}) {
-  if (!plain(body) || Object.keys(body).some((key) => !['roleId', 'roleIds', 'connectionId', 'model', 'title', 'effort', 'temperature', 'allowForgeImages'].includes(key))) fail('conversation_invalid');
+  if (!plain(body) || Object.keys(body).some((key) => !['roleId', 'roleIds', 'connectionId', 'model', 'title', 'effort', 'temperature'].includes(key))) fail('conversation_invalid');
   const participants = body.roleIds !== undefined ? body.roleIds : body.roleId !== undefined ? [body.roleId] : existing.roleIds || [existing.roleId];
   if (!Array.isArray(participants) || !participants.length || participants.length >= MAX.transcript) fail('role_ids_invalid');
   const roleIds = participants.map((value) => id(value, 'role_id'));
@@ -86,10 +92,8 @@ function validateConversation(body, existing = {}) {
   if (effort != null && (typeof effort !== 'string' || !['off', 'minimal', 'low', 'medium', 'high', 'ultra', 'xhigh', 'max'].includes(effort))) fail('model_reasoning_effort_invalid');
   const temperature = body.temperature === undefined ? existing.temperature : body.temperature;
   if (temperature != null && (typeof temperature !== 'number' || !Number.isFinite(temperature) || temperature < 0 || temperature > 2)) fail('model_temperature_invalid');
-  const allowForgeImages = body.allowForgeImages === undefined ? existing.allowForgeImages === true : body.allowForgeImages;
-  if (typeof allowForgeImages !== 'boolean') fail('allow_forge_images_invalid');
   return {
-    roleIds, roleId: roleIds[0], allowForgeImages,
+    roleIds, roleId: roleIds[0],
     connectionId: text(body.connectionId ?? existing.connectionId, 'connection_id', 128, { required: true }),
     model: text(body.model ?? existing.model, 'model', 256, { required: true }),
     title: text(body.title ?? existing.title, 'title', MAX.name),
@@ -111,7 +115,7 @@ function generationControls(conversation, model) {
 function buildPrompt(role, conversation, roles) {
   const transcript = conversation.messages.filter((message) => message.type !== 'forge_image').map((message) => `${message.role === 'user' ? 'Operator' : message.roleName || roles.find((item) => item.id === message.roleId)?.name || message.roleId || 'Role'}:\n${message.content}`).join('\n\n');
   const cast = conversation.roleIds.map((roleId) => roles.find((item) => item.id === roleId)?.name || roleId).join(', ');
-  return [role.soul, `# Theater boundary\n${FICTION_BOUNDARY}`, conversation.allowForgeImages ? IMAGE_DIRECTIVE.prompt : '', `# Participants\n${cast}\nReply only as ${role.name}.`, '# Conversation', transcript, `${role.name}:`].filter(Boolean).join('\n\n');
+  return [role.soul, `# Theater boundary\n${FICTION_BOUNDARY}`, role.allowForgeImages ? IMAGE_DIRECTIVE.prompt : '', `# Participants\n${cast}\nReply only as ${role.name}.`, '# Conversation', transcript, `${role.name}:`].filter(Boolean).join('\n\n');
 }
 
 export async function activate(context) {
@@ -119,7 +123,7 @@ export async function activate(context) {
   const serial = (work) => { const next = mutation.then(work, work); mutation = next.catch(() => {}); return next; };
   const readRoles = async () => {
     const stored = await context.settings.get('roles', null);
-    return Array.isArray(stored) ? stored : [clone(DEFAULT_ROLE)];
+    return Array.isArray(stored) ? stored.map(normalizeRole) : [clone(DEFAULT_ROLE)];
   };
   const readConversations = async () => {
     const stored = await context.settings.get('conversations', []);
@@ -207,9 +211,10 @@ export async function activate(context) {
       if (!current) fail('conversation_not_found', 404);
       snapshot = JSON.stringify(current);
       conversation = clone(current);
-      const reservedReplies = conversation.roleIds.length * (conversation.allowForgeImages ? 2 : 1);
-      if (conversation.messages.length + 1 + reservedReplies > MAX.transcript) fail('conversation_message_limit', 409);
       roles = await readRoles();
+      const enabledImageRoles = conversation.roleIds.filter((roleId) => roles?.find((item) => item.id === roleId)?.allowForgeImages === true).length;
+      const reservedReplies = conversation.roleIds.length + enabledImageRoles;
+      if (conversation.messages.length + 1 + reservedReplies > MAX.transcript) fail('conversation_message_limit', 409);
       if (conversation.roleIds.some((roleId) => !roles.some((item) => item.id === roleId))) fail('role_not_found', 404);
       const model = (await context.models.list()).find((item) => item.connectionId === conversation.connectionId && item.model === conversation.model);
       if (!model) fail('model_not_found', 404);
@@ -221,7 +226,7 @@ export async function activate(context) {
       const role = roles.find((item) => item.id === roleId);
       const generated = await context.models.generateText({ connectionId: conversation.connectionId, model: conversation.model, prompt: buildPrompt(role, conversation, roles), maxTokens, tools: null, ...controls });
       const rawReply = text(generated?.text, 'generated_text', MAX.message, { required: true });
-      const parsed = conversation.allowForgeImages ? parseImageDirective(rawReply) : { content: rawReply, prompt: null };
+      const parsed = role.allowForgeImages ? parseImageDirective(rawReply) : { content: rawReply, prompt: null };
       if (parsed.content) conversation.messages.push({ id: randomUUID(), role: 'assistant', roleId, roleName: role.name, content: parsed.content, createdAt: now() });
       if (parsed.prompt) {
         const timestamp = now();

@@ -18,8 +18,9 @@ The role is defined with the same SOUL-style Markdown used by Burrow agents. The
 
 - Familiar Burrow-style chat and composer
 - Reusable SOUL roles managed through Burrow Settings
+- Optional Forge images enabled independently for each role when Core has an image model available
 - Configured model selection, including local text-only models
-- Persistent isolated conversations
+- Persistent isolated conversations with immediate operator-message feedback while replies generate
 - Explicit fiction boundary with no operational agent behavior
 - Responsive desktop and mobile layouts
 
