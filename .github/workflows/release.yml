@@ -16,8 +16,10 @@ jobs:
         with: { ref: main, fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: 24 }
-      - name: Contract gate
-        run: npm test
+      - name: Standalone contract gate
+        run: |
+          npm run build
+          node --test test/server.test.mjs test/ui.test.mjs
       - name: Assign calendar version
         id: version
         run: |
