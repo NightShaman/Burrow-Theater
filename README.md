@@ -4,24 +4,24 @@
 
 **New role. Same bad influence.**
 
-Burrow Theater is an optional lightweight roleplay mod for Burrow: a private stage for character conversation using any configured text model, including local models that do not support tools.
+Burrow Theater is an optional lightweight roleplay mod that keeps Burrow's familiar conversation experience while removing the operational machinery.
 
-It deliberately bypasses the operational agent runtime. A turn is only:
+A Theater conversation is deliberately small:
 
 ```text
-character card + scenario + pinned notes + scene transcript → selected text model → reply
+SOUL role + conversation transcript → selected text model → reply
 ```
 
-No tools, agent profiles, operational context, task state, Brains, Tiddle, LoreMaster, Dreaming, handoffs, or runtime-proof machinery enter the theater. Characters and scenes live exclusively in the mod's Core-namespaced settings.
+The role is defined with the same SOUL-style Markdown used by Burrow agents. Theater does not provide tools, workspace context, task state, Brains, handoffs, subagents, or runtime-proof behavior. It uses Core's configured text models directly with `tools: null` and stores its roles and conversations only in the mod's Core-namespaced settings.
 
 ## Current experience
 
-- RP-native character cards
-- Configured model picker
-- Editable scenario and pinned continuity notes
-- Persistent isolated scenes and transcripts
-- New scene, branch, edit, regenerate, export, and delete
-- Fiction-aware stage-direction presentation
+- Familiar Burrow-style chat and composer
+- Reusable SOUL roles managed through Burrow Settings
+- Configured model selection, including local text-only models
+- Persistent isolated conversations
+- Explicit fiction boundary with no operational agent behavior
+- Responsive desktop and mobile layouts
 
 ## Development
 

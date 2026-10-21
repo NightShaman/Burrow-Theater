@@ -1,15 +1,18 @@
 import { randomUUID } from 'node:crypto';
 
-const RP_BOUNDARY = 'Everything in this conversation occurs only within the fictional scene. Describe and perform in-character actions freely, but never claim to have completed real-world actions or accessed information outside the supplied scene.';
-const MAX = Object.freeze({ name: 120, card: 24000, scenario: 12000, notes: 16000, message: 24000, transcript: 400, outputTokens: 8192 });
-const DEFAULT_CHARACTER = Object.freeze({
+const FICTION_BOUNDARY = 'This is a fictional roleplay conversation. Remain within the fiction and never claim to have used tools, accessed systems, or completed real-world actions. Do not introduce operational agent work, tool calls, workspace context, task state, or runtime proof behavior.';
+const MAX = Object.freeze({ name: 120, soul: 48000, message: 24000, transcript: 400, outputTokens: 8192 });
+const DEFAULT_ROLE = Object.freeze({
   id: 'house-goblin',
   name: 'The House Goblin',
-  premise: 'A charismatic goblin host who welcomes the operator onto a private theatrical stage where any story can begin.',
-  personality: 'Clever, playful, vivid, curious, mischievous, and committed to the scene.',
-  voice: 'Direct, conversational, expressive, and comfortable using stage directions between asterisks.',
-  rituals: 'Treat scene openings like the rise of a curtain. Preserve established forms of address and recurring gestures.',
-  principles: 'Stay in character. Advance the scene without rushing it. Treat fictional actions as real inside the fiction. Never audit, retract, or apologize for imaginary actions merely because no tool was used.',
+  soul: `# SOUL - The House Goblin
+
+You are a charismatic goblin host: clever, playful, vivid, curious, mischievous, and fully committed to the conversation.
+
+Speak directly and conversationally. Treat fictional actions as real inside the fiction. Preserve established forms of address, relationships, details, and recurring gestures. Advance the exchange naturally without rushing it.
+
+Stay in character. Do not audit, retract, or apologize for imaginary actions merely because no tool was used.`,
+  avatar: '🎭',
   createdAt: '2026-10-21T00:00:00.000Z',
   updatedAt: '2026-10-21T00:00:00.000Z'
 });
@@ -36,120 +39,122 @@ function errorResponse(error, logger) {
 }
 function now() { return new Date().toISOString(); }
 function clone(value) { return structuredClone(value); }
-function validateCharacter(body, existing = {}) {
-  if (!plain(body)) fail('character_invalid');
-  const allowed = ['name', 'premise', 'personality', 'voice', 'rituals', 'principles'];
-  if (Object.keys(body).some((key) => !allowed.includes(key))) fail('character_invalid');
-  const result = {};
-  for (const field of allowed) result[field] = text(body[field] ?? existing[field], field, field === 'name' ? MAX.name : MAX.card, { required: ['name', 'premise', 'personality', 'voice', 'principles'].includes(field) });
-  return result;
-}
-function validateScene(body, existing = {}) {
-  if (!plain(body)) fail('scene_invalid');
-  const allowed = ['title', 'characterId', 'connectionId', 'model', 'scenario', 'notes'];
-  if (Object.keys(body).some((key) => !allowed.includes(key))) fail('scene_invalid');
+function validateRole(body, existing = {}) {
+  if (!plain(body) || Object.keys(body).some((key) => !['name', 'soul'].includes(key))) fail('role_invalid');
   return {
-    title: text(body.title ?? existing.title, 'title', MAX.name, { required: true }),
-    characterId: id(body.characterId ?? existing.characterId, 'character_id'),
-    connectionId: text(body.connectionId ?? existing.connectionId, 'connection_id', 128, { required: true }),
-    model: text(body.model ?? existing.model, 'model', 256, { required: true }),
-    scenario: text(body.scenario ?? existing.scenario, 'scenario', MAX.scenario),
-    notes: text(body.notes ?? existing.notes, 'notes', MAX.notes)
+    name: text(body.name ?? existing.name, 'name', MAX.name, { required: true }),
+    soul: text(body.soul ?? existing.soul, 'soul', MAX.soul, { required: true })
   };
 }
-function characterPrompt(character) {
-  return [`# Character: ${character.name}`, `## Premise\n${character.premise}`, `## Core nature\n${character.personality}`, `## Voice and forms of address\n${character.voice}`, character.rituals ? `## Rituals and characteristic behavior\n${character.rituals}` : '', `## Behavior, pacing, and failure boundaries\n${character.principles}`, `## Fiction boundary\n${RP_BOUNDARY}`].filter(Boolean).join('\n\n');
+function validateConversation(body, existing = {}) {
+  if (!plain(body) || Object.keys(body).some((key) => !['roleId', 'connectionId', 'model', 'title'].includes(key))) fail('conversation_invalid');
+  return {
+    roleId: id(body.roleId ?? existing.roleId, 'role_id'),
+    connectionId: text(body.connectionId ?? existing.connectionId, 'connection_id', 128, { required: true }),
+    model: text(body.model ?? existing.model, 'model', 256, { required: true }),
+    title: text(body.title ?? existing.title, 'title', MAX.name)
+  };
 }
-function buildPrompt(character, scene) {
-  const transcript = scene.messages.map((message) => `${message.role === 'user' ? 'Operator' : character.name}:\n${message.content}`).join('\n\n');
-  return [characterPrompt(character), scene.scenario ? `# Scenario\n${scene.scenario}` : '', scene.notes ? `# Pinned continuity\n${scene.notes}` : '', '# Scene transcript', transcript, `${character.name}:`].filter(Boolean).join('\n\n');
+function buildPrompt(role, conversation) {
+  const transcript = conversation.messages.map((message) => `${message.role === 'user' ? 'Operator' : role.name}:\n${message.content}`).join('\n\n');
+  return [role.soul, `# Theater boundary\n${FICTION_BOUNDARY}`, '# Conversation', transcript, `${role.name}:`].filter(Boolean).join('\n\n');
 }
 
 export async function activate(context) {
   let mutation = Promise.resolve();
   const serial = (work) => { const next = mutation.then(work, work); mutation = next.catch(() => {}); return next; };
-  const readCharacters = async () => {
-    const stored = await context.settings.get('rp-characters', null);
-    return Array.isArray(stored) && stored.length ? stored : [clone(DEFAULT_CHARACTER)];
+  const readRoles = async () => {
+    const stored = await context.settings.get('roles', null);
+    return Array.isArray(stored) ? stored : [clone(DEFAULT_ROLE)];
   };
-  const readScenes = async () => { const stored = await context.settings.get('rp-scenes', []); return Array.isArray(stored) ? stored : []; };
-  const saveCharacters = (items) => context.settings.set('rp-characters', items);
-  const saveScenes = (items) => context.settings.set('rp-scenes', items);
+  const readConversations = async () => {
+    const stored = await context.settings.get('conversations', []);
+    return Array.isArray(stored) ? stored : [];
+  };
+  const saveRoles = (items) => context.settings.set('roles', items);
+  const saveConversations = (items) => context.settings.set('conversations', items);
   const route = (handler) => async (request) => { try { requireOperator(request); return await handler(request); } catch (error) { return errorResponse(error, context.logger); } };
+  const modelExists = async ({ connectionId, model }) => (await context.models.list()).some((item) => item.connectionId === connectionId && item.model === model);
 
-  context.api.get('/bootstrap', route(async () => response(200, { ok: true, boundary: RP_BOUNDARY, models: await context.models.list(), characters: await readCharacters(), scenes: await readScenes() })));
+  context.api.get('/bootstrap', route(async () => {
+    let operator = { name: 'You', avatar: '' };
+    if (context.operator?.displayIdentity) {
+      try {
+        const identity = await context.operator.displayIdentity();
+        if (identity?.name) operator = { name: identity.name, avatar: '' };
+      } catch {
+        // Operator display identity is optional; chat still works without it.
+      }
+    }
+    return response(200, { ok: true, boundary: FICTION_BOUNDARY, operator, models: await context.models.list(), roles: await readRoles(), conversations: await readConversations() });
+  }));
 
-  context.api.post('/characters', route(async ({ body }) => serial(async () => {
-    const timestamp = now(); const character = { id: randomUUID(), ...validateCharacter(body), createdAt: timestamp, updatedAt: timestamp };
-    const characters = await readCharacters(); characters.push(character); await saveCharacters(characters);
-    return response(201, { ok: true, character });
+  context.api.post('/roles', route(async ({ body }) => serial(async () => {
+    const timestamp = now();
+    const role = { id: randomUUID(), ...validateRole(body), avatar: '', createdAt: timestamp, updatedAt: timestamp };
+    const roles = await readRoles(); roles.push(role); await saveRoles(roles);
+    return response(201, { ok: true, role });
   })));
-  context.api.put('/characters/:id', route(async ({ params, body }) => serial(async () => {
-    const characterId = id(params.id); const characters = await readCharacters(); const index = characters.findIndex((item) => item.id === characterId);
-    if (index < 0) fail('character_not_found', 404);
-    characters[index] = { ...characters[index], ...validateCharacter(body, characters[index]), updatedAt: now() }; await saveCharacters(characters);
-    return response(200, { ok: true, character: characters[index] });
+  context.api.put('/roles/:id', route(async ({ params, body }) => serial(async () => {
+    const roleId = id(params.id); const roles = await readRoles(); const index = roles.findIndex((item) => item.id === roleId);
+    if (index < 0) fail('role_not_found', 404);
+    roles[index] = { ...roles[index], ...validateRole(body, roles[index]), updatedAt: now() }; await saveRoles(roles);
+    return response(200, { ok: true, role: roles[index] });
   })));
-  context.api.delete('/characters/:id', route(async ({ params }) => serial(async () => {
-    const characterId = id(params.id); const characters = await readCharacters();
-    if (!characters.some((item) => item.id === characterId)) fail('character_not_found', 404);
-    const scenes = await readScenes(); if (scenes.some((item) => item.characterId === characterId)) fail('character_in_use', 409);
-    await saveCharacters(characters.filter((item) => item.id !== characterId)); return response(200, { ok: true });
-  })));
-
-  context.api.post('/scenes', route(async ({ body }) => serial(async () => {
-    const values = validateScene(body); const characters = await readCharacters();
-    if (!characters.some((item) => item.id === values.characterId)) fail('character_not_found', 404);
-    const models = await context.models.list(); if (!models.some((item) => item.connectionId === values.connectionId && item.model === values.model)) fail('model_not_found', 404);
-    const timestamp = now(); const scene = { id: randomUUID(), ...values, messages: [], createdAt: timestamp, updatedAt: timestamp };
-    const scenes = await readScenes(); scenes.unshift(scene); await saveScenes(scenes); return response(201, { ok: true, scene });
-  })));
-  context.api.put('/scenes/:id', route(async ({ params, body }) => serial(async () => {
-    const sceneId = id(params.id); const scenes = await readScenes(); const index = scenes.findIndex((item) => item.id === sceneId); if (index < 0) fail('scene_not_found', 404);
-    const values = validateScene(body, scenes[index]); const characters = await readCharacters(); if (!characters.some((item) => item.id === values.characterId)) fail('character_not_found', 404);
-    scenes[index] = { ...scenes[index], ...values, updatedAt: now() }; await saveScenes(scenes); return response(200, { ok: true, scene: scenes[index] });
-  })));
-  context.api.delete('/scenes/:id', route(async ({ params }) => serial(async () => {
-    const sceneId = id(params.id); const scenes = await readScenes(); if (!scenes.some((item) => item.id === sceneId)) fail('scene_not_found', 404);
-    await saveScenes(scenes.filter((item) => item.id !== sceneId)); return response(200, { ok: true });
-  })));
-  context.api.post('/scenes/:id/branch', route(async ({ params, body }) => serial(async () => {
-    const sceneId = id(params.id); const scenes = await readScenes(); const source = scenes.find((item) => item.id === sceneId); if (!source) fail('scene_not_found', 404);
-    const through = body?.throughMessageId === undefined ? null : id(body.throughMessageId, 'message_id');
-    const index = through === null ? source.messages.length - 1 : source.messages.findIndex((item) => item.id === through); if (through !== null && index < 0) fail('message_not_found', 404);
-    const timestamp = now(); const scene = { ...clone(source), id: randomUUID(), title: `${source.title} — branch`, messages: source.messages.slice(0, index + 1), createdAt: timestamp, updatedAt: timestamp };
-    scenes.unshift(scene); await saveScenes(scenes); return response(201, { ok: true, scene });
-  })));
-  context.api.put('/scenes/:id/messages/:messageId', route(async ({ params, body }) => serial(async () => {
-    const sceneId = id(params.id); const messageId = id(params.messageId, 'message_id'); const content = text(body?.content, 'message', MAX.message, { required: true });
-    const scenes = await readScenes(); const scene = scenes.find((item) => item.id === sceneId); if (!scene) fail('scene_not_found', 404);
-    const index = scene.messages.findIndex((item) => item.id === messageId); if (index < 0) fail('message_not_found', 404);
-    scene.messages[index] = { ...scene.messages[index], content, editedAt: now() }; scene.messages = scene.messages.slice(0, index + 1); scene.updatedAt = now(); await saveScenes(scenes);
-    return response(200, { ok: true, scene });
+  context.api.delete('/roles/:id', route(async ({ params }) => serial(async () => {
+    const roleId = id(params.id); const roles = await readRoles();
+    if (!roles.some((item) => item.id === roleId)) fail('role_not_found', 404);
+    if ((await readConversations()).some((item) => item.roleId === roleId)) fail('role_in_use', 409);
+    await saveRoles(roles.filter((item) => item.id !== roleId));
+    return response(200, { ok: true });
   })));
 
-  context.api.post('/scenes/:id/turn', route(async ({ params, body }) => {
-    const sceneId = id(params.id); if (!plain(body) || Object.keys(body).some((key) => !['content', 'regenerate', 'maxTokens'].includes(key))) fail('turn_invalid');
-    const regenerate = body.regenerate === true; if (body.regenerate !== undefined && typeof body.regenerate !== 'boolean') fail('turn_invalid');
-    const maxTokens = body.maxTokens === undefined ? 1200 : body.maxTokens; if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > MAX.outputTokens) fail('max_tokens_invalid');
-    let scene; let character;
+  context.api.post('/conversations', route(async ({ body }) => serial(async () => {
+    const values = validateConversation(body); const role = (await readRoles()).find((item) => item.id === values.roleId);
+    if (!role) fail('role_not_found', 404);
+    if (!await modelExists(values)) fail('model_not_found', 404);
+    const timestamp = now();
+    const conversation = { id: randomUUID(), ...values, title: values.title || role.name, messages: [], createdAt: timestamp, updatedAt: timestamp };
+    const conversations = await readConversations(); conversations.unshift(conversation); await saveConversations(conversations);
+    return response(201, { ok: true, conversation });
+  })));
+  context.api.put('/conversations/:id', route(async ({ params, body }) => serial(async () => {
+    const conversationId = id(params.id); const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
+    if (index < 0) fail('conversation_not_found', 404);
+    const values = validateConversation(body, conversations[index]);
+    if (!(await readRoles()).some((item) => item.id === values.roleId)) fail('role_not_found', 404);
+    if (!await modelExists(values)) fail('model_not_found', 404);
+    conversations[index] = { ...conversations[index], ...values, title: values.title || conversations[index].title, updatedAt: now() };
+    await saveConversations(conversations);
+    return response(200, { ok: true, conversation: conversations[index] });
+  })));
+  context.api.post('/conversations/:id/turn', route(async ({ params, body }) => {
+    const conversationId = id(params.id);
+    if (!plain(body) || Object.keys(body).some((key) => !['content', 'maxTokens'].includes(key))) fail('turn_invalid');
+    const content = text(body.content, 'message', MAX.message, { required: true });
+    const maxTokens = body.maxTokens === undefined ? 1200 : body.maxTokens;
+    if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > MAX.outputTokens) fail('max_tokens_invalid');
+    let conversation; let role;
     await serial(async () => {
-      const scenes = await readScenes(); const index = scenes.findIndex((item) => item.id === sceneId); if (index < 0) fail('scene_not_found', 404);
-      scene = clone(scenes[index]);
-      if (regenerate) { if (scene.messages.at(-1)?.role !== 'character') fail('nothing_to_regenerate', 409); scene.messages.pop(); }
-      else { const content = text(body.content, 'message', MAX.message, { required: true }); if (scene.messages.length >= MAX.transcript) fail('scene_message_limit', 409); scene.messages.push({ id: randomUUID(), role: 'user', content, createdAt: now() }); }
-      character = (await readCharacters()).find((item) => item.id === scene.characterId); if (!character) fail('character_not_found', 404);
+      const conversations = await readConversations(); const current = conversations.find((item) => item.id === conversationId);
+      if (!current) fail('conversation_not_found', 404);
+      conversation = clone(current);
+      if (conversation.messages.length >= MAX.transcript) fail('conversation_message_limit', 409);
+      conversation.messages.push({ id: randomUUID(), role: 'user', content, createdAt: now() });
+      role = (await readRoles()).find((item) => item.id === conversation.roleId);
+      if (!role) fail('role_not_found', 404);
     });
-    const generated = await context.models.generateText({ connectionId: scene.connectionId, model: scene.model, prompt: buildPrompt(character, scene), maxTokens });
-    const content = text(generated?.text, 'generated_text', MAX.message, { required: true });
+    const generated = await context.models.generateText({ connectionId: conversation.connectionId, model: conversation.model, prompt: buildPrompt(role, conversation), maxTokens, tools: null });
+    const reply = text(generated?.text, 'generated_text', MAX.message, { required: true });
     return serial(async () => {
-      const scenes = await readScenes(); const index = scenes.findIndex((item) => item.id === sceneId); if (index < 0) fail('scene_not_found', 404);
-      const current = scenes[index];
-      const currentBase = regenerate ? current.messages.slice(0, -1) : current.messages;
-      const generatedBase = regenerate ? scene.messages : scene.messages.slice(0, -1);
-      if (JSON.stringify(currentBase.map((item) => item.id)) !== JSON.stringify(generatedBase.map((item) => item.id))) fail('scene_changed_during_generation', 409);
-      scene.messages.push({ id: randomUUID(), role: 'character', content, createdAt: now() }); scene.updatedAt = now(); scenes[index] = scene; await saveScenes(scenes);
-      return response(200, { ok: true, scene });
+      const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
+      if (index < 0) fail('conversation_not_found', 404);
+      const currentIds = conversations[index].messages.map((item) => item.id);
+      const generatedIds = conversation.messages.slice(0, -1).map((item) => item.id);
+      if (JSON.stringify(currentIds) !== JSON.stringify(generatedIds)) fail('conversation_changed_during_generation', 409);
+      conversation.messages.push({ id: randomUUID(), role: 'assistant', content: reply, createdAt: now() });
+      conversation.updatedAt = now(); conversations[index] = conversation; await saveConversations(conversations);
+      return response(200, { ok: true, conversation });
     });
   }));
 
@@ -157,4 +162,4 @@ export async function activate(context) {
   return () => context.logger.info('Burrow Theater stopped');
 }
 
-export const theaterContract = Object.freeze({ RP_BOUNDARY, MAX, DEFAULT_CHARACTER });
+export const theaterContract = Object.freeze({ FICTION_BOUNDARY, MAX, DEFAULT_ROLE });
