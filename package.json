@@ -3,7 +3,9 @@
   "version": "2026.10.21",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "build": "node --check server/index.mjs && node --check ui/control.js",
     "test": "node --test test/*.test.mjs",
