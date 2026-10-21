@@ -26,6 +26,10 @@ The role is defined with the same SOUL-style Markdown used by Burrow agents. The
 - Explicit fiction boundary with no operational agent behavior
 - Responsive desktop and mobile layouts
 
+## User guide
+
+Start with the [Theater guide](docs/guide/index.md) for roles, group conversations, Forge images, and current limits.
+
 ## Development
 
 Requires Node.js 22.13+ and a sibling `Burrow-Backend` checkout for the Core contract test.
