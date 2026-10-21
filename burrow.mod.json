@@ -10,14 +10,14 @@
   "contributions": {
     "settings": [
       {
-        "id": "characters",
+        "id": "roles",
         "navigation": {
           "title": "Burrow Theater",
-          "description": "Manage the cast for private roleplay scenes."
+          "description": "Manage SOUL roles for private, tool-free conversations."
         },
         "primary": {
-          "title": "Characters",
-          "description": "Create and refine reusable character cards for Theater scenes.",
+          "title": "Roles",
+          "description": "Create and refine the identities used in Theater conversations.",
           "capability": "settingsUi"
         }
       }
