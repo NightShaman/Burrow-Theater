@@ -46,18 +46,46 @@ function validateRole(body, existing = {}) {
     soul: text(body.soul ?? existing.soul, 'soul', MAX.soul, { required: true })
   };
 }
+function normalizeConversation(conversation) {
+  const roleIds = Array.isArray(conversation.roleIds) && conversation.roleIds.length ? conversation.roleIds : [conversation.roleId];
+  return { ...conversation, roleIds, roleId: roleIds[0], messages: (conversation.messages || []).map((message) =>
+    message.role === 'assistant' && !message.roleId ? { ...message, roleId: conversation.roleId || roleIds[0] } : message) };
+}
 function validateConversation(body, existing = {}) {
-  if (!plain(body) || Object.keys(body).some((key) => !['roleId', 'connectionId', 'model', 'title'].includes(key))) fail('conversation_invalid');
+  if (!plain(body) || Object.keys(body).some((key) => !['roleId', 'roleIds', 'connectionId', 'model', 'title', 'effort', 'temperature'].includes(key))) fail('conversation_invalid');
+  const participants = body.roleIds !== undefined ? body.roleIds : body.roleId !== undefined ? [body.roleId] : existing.roleIds || [existing.roleId];
+  if (!Array.isArray(participants) || !participants.length || participants.length >= MAX.transcript) fail('role_ids_invalid');
+  const roleIds = participants.map((value) => id(value, 'role_id'));
+  if (new Set(roleIds).size !== roleIds.length) fail('role_ids_invalid');
+  if (body.roleIds !== undefined && body.roleId !== undefined && body.roleId !== roleIds[0]) fail('role_ids_invalid');
+  const effort = body.effort === undefined ? existing.effort : body.effort;
+  if (effort != null && (typeof effort !== 'string' || !['off', 'minimal', 'low', 'medium', 'high', 'ultra', 'xhigh', 'max'].includes(effort))) fail('model_reasoning_effort_invalid');
+  const temperature = body.temperature === undefined ? existing.temperature : body.temperature;
+  if (temperature != null && (typeof temperature !== 'number' || !Number.isFinite(temperature) || temperature < 0 || temperature > 2)) fail('model_temperature_invalid');
   return {
-    roleId: id(body.roleId ?? existing.roleId, 'role_id'),
+    roleIds, roleId: roleIds[0],
     connectionId: text(body.connectionId ?? existing.connectionId, 'connection_id', 128, { required: true }),
     model: text(body.model ?? existing.model, 'model', 256, { required: true }),
-    title: text(body.title ?? existing.title, 'title', MAX.name)
+    title: text(body.title ?? existing.title, 'title', MAX.name),
+    effort: effort ?? null, temperature: temperature ?? null
   };
 }
-function buildPrompt(role, conversation) {
-  const transcript = conversation.messages.map((message) => `${message.role === 'user' ? 'Operator' : role.name}:\n${message.content}`).join('\n\n');
-  return [role.soul, `# Theater boundary\n${FICTION_BOUNDARY}`, '# Conversation', transcript, `${role.name}:`].filter(Boolean).join('\n\n');
+function generationControls(conversation, model) {
+  const controls = {};
+  if (conversation.effort != null) {
+    if (conversation.effort !== 'off' && (!Array.isArray(model.reasoningEfforts) || !model.reasoningEfforts.includes(conversation.effort))) fail('model_reasoning_effort_not_supported');
+    controls.effort = conversation.effort;
+  }
+  if (conversation.temperature != null) {
+    if (model.supportsTemperature !== true) fail('model_temperature_not_supported');
+    controls.temperature = conversation.temperature;
+  }
+  return controls;
+}
+function buildPrompt(role, conversation, roles) {
+  const transcript = conversation.messages.map((message) => `${message.role === 'user' ? 'Operator' : message.roleName || roles.find((item) => item.id === message.roleId)?.name || message.roleId || 'Role'}:\n${message.content}`).join('\n\n');
+  const cast = conversation.roleIds.map((roleId) => roles.find((item) => item.id === roleId)?.name || roleId).join(', ');
+  return [role.soul, `# Theater boundary\n${FICTION_BOUNDARY}`, `# Participants\n${cast}\nReply only as ${role.name}.`, '# Conversation', transcript, `${role.name}:`].filter(Boolean).join('\n\n');
 }
 
 export async function activate(context) {
@@ -69,12 +97,24 @@ export async function activate(context) {
   };
   const readConversations = async () => {
     const stored = await context.settings.get('conversations', []);
-    return Array.isArray(stored) ? stored : [];
+    return Array.isArray(stored) ? stored.map(normalizeConversation) : [];
   };
   const saveRoles = (items) => context.settings.set('roles', items);
   const saveConversations = (items) => context.settings.set('conversations', items);
   const route = (handler) => async (request) => { try { requireOperator(request); return await handler(request); } catch (error) { return errorResponse(error, context.logger); } };
-  const modelExists = async ({ connectionId, model }) => (await context.models.list()).some((item) => item.connectionId === connectionId && item.model === model);
+  const validateSelection = async (values, body = {}, existing = {}) => {
+    const roles = await readRoles();
+    if (values.roleIds.some((roleId) => !roles.some((item) => item.id === roleId))) fail('role_not_found', 404);
+    const model = (await context.models.list()).find((item) => item.connectionId === values.connectionId && item.model === values.model);
+    if (!model) fail('model_not_found', 404);
+    // Switching models clears incompatible inherited controls, but explicit selections are errors.
+    if (existing.model !== values.model || existing.connectionId !== values.connectionId) {
+      if (body.effort === undefined && !model.reasoningEfforts?.includes(values.effort)) values.effort = null;
+      if (body.temperature === undefined && model.supportsTemperature !== true) values.temperature = null;
+    }
+    generationControls(values, model);
+    return roles;
+  };
 
   context.api.get('/bootstrap', route(async () => {
     let operator = { name: 'You', avatar: '' };
@@ -104,17 +144,17 @@ export async function activate(context) {
   context.api.delete('/roles/:id', route(async ({ params }) => serial(async () => {
     const roleId = id(params.id); const roles = await readRoles();
     if (!roles.some((item) => item.id === roleId)) fail('role_not_found', 404);
-    if ((await readConversations()).some((item) => item.roleId === roleId)) fail('role_in_use', 409);
+    if ((await readConversations()).some((item) => item.roleIds.includes(roleId))) fail('role_in_use', 409);
     await saveRoles(roles.filter((item) => item.id !== roleId));
     return response(200, { ok: true });
   })));
 
   context.api.post('/conversations', route(async ({ body }) => serial(async () => {
-    const values = validateConversation(body); const role = (await readRoles()).find((item) => item.id === values.roleId);
-    if (!role) fail('role_not_found', 404);
-    if (!await modelExists(values)) fail('model_not_found', 404);
+    const values = validateConversation(body); const roles = await validateSelection(values, body);
+    const role = roles.find((item) => item.id === values.roleId);
     const timestamp = now();
-    const conversation = { id: randomUUID(), ...values, title: values.title || role.name, messages: [], createdAt: timestamp, updatedAt: timestamp };
+    const defaultTitle = values.roleIds.map((roleId) => roles.find((item) => item.id === roleId)?.name).filter(Boolean).join(', ');
+    const conversation = { id: randomUUID(), ...values, title: values.title || defaultTitle || role.name, messages: [], createdAt: timestamp, updatedAt: timestamp };
     const conversations = await readConversations(); conversations.unshift(conversation); await saveConversations(conversations);
     return response(201, { ok: true, conversation });
   })));
@@ -122,8 +162,7 @@ export async function activate(context) {
     const conversationId = id(params.id); const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
     if (index < 0) fail('conversation_not_found', 404);
     const values = validateConversation(body, conversations[index]);
-    if (!(await readRoles()).some((item) => item.id === values.roleId)) fail('role_not_found', 404);
-    if (!await modelExists(values)) fail('model_not_found', 404);
+    await validateSelection(values, body, conversations[index]);
     conversations[index] = { ...conversations[index], ...values, title: values.title || conversations[index].title, updatedAt: now() };
     await saveConversations(conversations);
     return response(200, { ok: true, conversation: conversations[index] });
@@ -134,25 +173,33 @@ export async function activate(context) {
     const content = text(body.content, 'message', MAX.message, { required: true });
     const maxTokens = body.maxTokens === undefined ? 1200 : body.maxTokens;
     if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > MAX.outputTokens) fail('max_tokens_invalid');
-    let conversation; let role;
+    let conversation; let roles; let snapshot; let controls;
     await serial(async () => {
       const conversations = await readConversations(); const current = conversations.find((item) => item.id === conversationId);
       if (!current) fail('conversation_not_found', 404);
+      snapshot = JSON.stringify(current);
       conversation = clone(current);
-      if (conversation.messages.length >= MAX.transcript) fail('conversation_message_limit', 409);
+      if (conversation.messages.length + 1 + conversation.roleIds.length > MAX.transcript) fail('conversation_message_limit', 409);
+      roles = await readRoles();
+      if (conversation.roleIds.some((roleId) => !roles.some((item) => item.id === roleId))) fail('role_not_found', 404);
+      const model = (await context.models.list()).find((item) => item.connectionId === conversation.connectionId && item.model === conversation.model);
+      if (!model) fail('model_not_found', 404);
+      controls = generationControls(conversation, model);
       conversation.messages.push({ id: randomUUID(), role: 'user', content, createdAt: now() });
-      role = (await readRoles()).find((item) => item.id === conversation.roleId);
-      if (!role) fail('role_not_found', 404);
     });
-    const generated = await context.models.generateText({ connectionId: conversation.connectionId, model: conversation.model, prompt: buildPrompt(role, conversation), maxTokens, tools: null });
-    const reply = text(generated?.text, 'generated_text', MAX.message, { required: true });
+    // Sequential generation lets each participant hear the preceding replies. Commit the whole turn atomically.
+    for (const roleId of conversation.roleIds) {
+      const role = roles.find((item) => item.id === roleId);
+      const generated = await context.models.generateText({ connectionId: conversation.connectionId, model: conversation.model, prompt: buildPrompt(role, conversation, roles), maxTokens, tools: null, ...controls });
+      const reply = text(generated?.text, 'generated_text', MAX.message, { required: true });
+      conversation.messages.push({ id: randomUUID(), role: 'assistant', roleId, roleName: role.name, content: reply, createdAt: now() });
+    }
     return serial(async () => {
       const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
       if (index < 0) fail('conversation_not_found', 404);
-      const currentIds = conversations[index].messages.map((item) => item.id);
-      const generatedIds = conversation.messages.slice(0, -1).map((item) => item.id);
-      if (JSON.stringify(currentIds) !== JSON.stringify(generatedIds)) fail('conversation_changed_during_generation', 409);
-      conversation.messages.push({ id: randomUUID(), role: 'assistant', content: reply, createdAt: now() });
+      const currentRoles = await readRoles();
+      if (JSON.stringify(conversations[index]) !== snapshot || conversation.roleIds.some((roleId) =>
+        JSON.stringify(currentRoles.find((item) => item.id === roleId)) !== JSON.stringify(roles.find((item) => item.id === roleId)))) fail('conversation_changed_during_generation', 409);
       conversation.updatedAt = now(); conversations[index] = conversation; await saveConversations(conversations);
       return response(200, { ok: true, conversation });
     });
