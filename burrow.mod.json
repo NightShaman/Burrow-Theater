@@ -4,6 +4,23 @@
   "version": "2026.10.21",
   "server": "server/index.mjs",
   "ui": {
-    "control": "ui/control.js"
+    "control": "ui/control.js",
+    "settings": "ui/settings.js"
+  },
+  "contributions": {
+    "settings": [
+      {
+        "id": "characters",
+        "navigation": {
+          "title": "Burrow Theater",
+          "description": "Manage the cast for private roleplay scenes."
+        },
+        "primary": {
+          "title": "Characters",
+          "description": "Create and refine reusable character cards for Theater scenes.",
+          "capability": "settingsUi"
+        }
+      }
+    ]
   }
 }
