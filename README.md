@@ -1,6 +1,8 @@
-# Burrow Theater
+<p align="center">
+  <img src="docs/assets/hero.png" width="720" alt="Burrow Theater — New role. Same bad influence." />
+</p>
 
-![Burrow Theater — New role. Same bad influence.](docs/assets/hero.png)
+# Burrow Theater
 
 **New role. Same bad influence.**
 
@@ -33,4 +35,10 @@ npm run build
 npm test
 ```
 
-Install through **Settings → Mods → Mod sources**, then explicitly enable the mod.
+Install through **Settings → Mods → Mod sources**:
+
+1. Add `https://github.com/GoblinKing-Burrow/Burrow-Theater.git`.
+2. Refresh and install a tagged version.
+3. Explicitly enable the mod.
+
+Burrow Theater is distributed under the [Burrow Sustainable Use License](LICENSE).
