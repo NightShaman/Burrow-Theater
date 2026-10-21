@@ -183,18 +183,20 @@ test('Forge images default off and the switch persists per conversation', async 
   assert.equal(updated.body.conversation.allowForgeImages, true); assert.equal(f.settings.get('conversations')[0].allowForgeImages, true);
 });
 
-test('enabled turns parse strict image directives, create durable jobs, and hide directives from prose', async () => {
+test('enabled turns durably return pending images before idempotent Forge enqueue and hide directives from prose', async () => {
   const f = fixture(); await activate(f.context); const created = await createConversation(f); const conversationId = created.body.conversation.id;
   await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id: conversationId }));
   f.context.models.generateText = async input => (f.generations.push(input), { text: 'Behold the stage.\n<!-- BURROW_FORGE_IMAGE {"prompt":"A moonlit goblin theater, wide shot"} -->' });
+  f.context.forge.images.create = async () => new Promise(() => {});
   const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Show me.' }, { id: conversationId }));
   assert.equal(turn.status, 200); assert.match(f.generations[0].prompt, /BURROW_FORGE_IMAGE/); assert.equal(f.generations[0].tools, null);
   assert.equal(turn.body.conversation.messages[1].content, 'Behold the stage.'); assert.doesNotMatch(turn.body.conversation.messages[1].content, /FORGE_IMAGE/);
-  const image = turn.body.conversation.messages[2]; assert.equal(image.type, 'forge_image'); assert.equal(image.roleId, 'house-goblin'); assert.equal(image.status, 'pending'); assert.equal(image.jobId, 'job-1');
-  assert.deepEqual(f.forgeCreates, [{ prompt: 'A moonlit goblin theater, wide shot', idempotencyKey: `message-${image.id}` }]);
-  f.forgeJobs.set(image.jobId, { ...f.forgeJobs.get(image.jobId), status: 'succeeded', artifacts: [{ id: 'a1', previewUrl: '/api/forge/jobs/job-1/artifacts/a1' }] });
+  const image = turn.body.conversation.messages[2]; assert.equal(image.type, 'forge_image'); assert.equal(image.roleId, 'house-goblin'); assert.equal(image.status, 'pending'); assert.equal(image.jobId, null);
+  assert.equal(f.forgeCreates.length, 0); assert.equal(f.settings.get('conversations')[0].messages[2].status, 'pending');
+  f.context.forge.images.create = async input => { f.forgeCreates.push(structuredClone(input)); const job = { id: 'job-1', status: 'succeeded', artifacts: [{ id: 'a1', previewUrl: '/api/forge/jobs/job-1/artifacts/a1' }] }; f.forgeJobs.set(job.id, job); return { job, replayed: false }; };
   const reconciled = await f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id: conversationId }));
   const completed = reconciled.body.conversation.messages[2]; assert.equal(completed.status, 'completed'); assert.equal(completed.previewUrl, '/api/forge/jobs/job-1/artifacts/a1');
+  assert.deepEqual(f.forgeCreates, [{ prompt: 'A moonlit goblin theater, wide shot', idempotencyKey: `message-${image.id}` }]);
   assert.equal(f.settings.get('conversations')[0].messages[2].status, 'completed');
 });
 
@@ -218,9 +220,49 @@ test('failed Forge creation and reload reconciliation persist attributed termina
   const f = fixture(); await activate(f.context); const created = await createConversation(f); const id = created.body.conversation.id;
   await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id }));
   f.context.models.generateText = async () => ({ text: 'Scene.\n<!-- BURROW_FORGE_IMAGE {"prompt":"A scene"} -->' });
-  f.context.forge.images.create = async () => { throw Error('forge_unavailable'); };
   const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Hello' }, { id })); const image = turn.body.conversation.messages[2];
   assert.equal(image.status, 'pending'); assert.equal(image.jobId, null); assert.equal(image.roleId, 'house-goblin'); assert.equal(f.settings.get('conversations')[0].messages[2].status, 'pending');
   f.context.forge.images.create = async input => { f.forgeCreates.push(input); const job = { id: 'job-recovered', status: 'failed', artifacts: [], error: 'provider_failed' }; f.forgeJobs.set(job.id, job); return { job, replayed: false }; };
   const retried = await f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id })); assert.equal(retried.body.conversation.messages[2].status, 'failed'); assert.equal(retried.body.conversation.messages[2].jobId, 'job-recovered');
+});
+
+
+test('a stale enqueue failure cannot erase a job receipt persisted by another reconcile', async () => {
+  const f = fixture(); await activate(f.context); const created = await createConversation(f); const id = created.body.conversation.id;
+  const stored = f.settings.get('conversations');
+  stored[0].messages.push({ id: 'image-1', type: 'forge_image', role: 'assistant', roleId: 'house-goblin', roleName: 'House Goblin', content: '', prompt: 'Stage', status: 'pending', jobId: null, previewUrl: null, error: null, createdAt: now, updatedAt: now });
+  f.settings.set('conversations', stored);
+  let calls = 0; let releaseStale; let releaseReceipt;
+  const stale = new Promise(resolve => { releaseStale = resolve; });
+  const receipt = new Promise(resolve => { releaseReceipt = resolve; });
+  f.context.forge.images.create = async () => ++calls === 1 ? stale : receipt;
+  const first = f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id }));
+  const second = f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id }));
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(calls, 2);
+  releaseReceipt({ job: { id: 'job-1', status: 'queued', artifacts: [] }, replayed: false });
+  assert.equal((await second).body.conversation.messages[0].jobId, 'job-1');
+  releaseStale({ job: null, replayed: false });
+  assert.equal((await first).body.conversation.messages[0].jobId, 'job-1');
+  assert.equal(f.settings.get('conversations')[0].messages[0].jobId, 'job-1');
+});
+
+test('overlapping Forge reconciles cannot regress a terminal image when completion order reverses', async () => {
+  const f = fixture(); await activate(f.context); const created = await createConversation(f); const id = created.body.conversation.id;
+  const stored = f.settings.get('conversations');
+  stored[0].messages.push({ id: 'image-1', type: 'forge_image', role: 'assistant', roleId: 'house-goblin', roleName: 'House Goblin', content: '', prompt: 'Stage', status: 'pending', jobId: 'job-1', previewUrl: null, error: null, createdAt: now, updatedAt: now });
+  f.settings.set('conversations', stored);
+  let calls = 0; let releaseStale; let releaseTerminal;
+  const stale = new Promise(resolve => { releaseStale = resolve; });
+  const terminal = new Promise(resolve => { releaseTerminal = resolve; });
+  f.context.forge.jobs.read = async () => ++calls === 1 ? stale : terminal;
+  const first = f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id }));
+  const second = f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id }));
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(calls, 2);
+  releaseTerminal({ id: 'job-1', status: 'succeeded', artifacts: [{ id: 'a1', previewUrl: '/preview.png' }] });
+  assert.equal((await second).body.conversation.messages[0].status, 'completed');
+  releaseStale({ id: 'job-1', status: 'running', artifacts: [] });
+  const afterStale = await first;
+  assert.equal(afterStale.body.conversation.messages[0].status, 'completed');
+  assert.equal(f.settings.get('conversations')[0].messages[0].status, 'completed');
+  assert.equal(f.settings.get('conversations')[0].messages[0].previewUrl, '/preview.png');
 });

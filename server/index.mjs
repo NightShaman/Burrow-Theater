@@ -236,22 +236,8 @@ export async function activate(context) {
         JSON.stringify(currentRoles.find((item) => item.id === roleId)) !== JSON.stringify(roles.find((item) => item.id === roleId)))) fail('conversation_changed_during_generation', 409);
       conversation.updatedAt = now(); conversations[index] = conversation; await saveConversations(conversations);
     });
-    const imageMessages = conversation.messages.filter((message) => message.type === 'forge_image' && message.status === 'pending' && !message.jobId);
-    for (const image of imageMessages) {
-      try {
-        const created = await context.forge.images.create({ prompt: image.prompt, idempotencyKey: `message-${image.id}` });
-        Object.assign(image, projectImageJob(image, created.job));
-      } catch (error) {
-        context.logger.warn('Burrow Theater could not create Forge image job', { conversationId, messageId: image.id, error: error instanceof Error ? error.message : 'unknown' });
-      }
-    }
-    if (imageMessages.length) await serial(async () => {
-      const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
-      if (index < 0) fail('conversation_not_found', 404);
-      const updates = new Map(imageMessages.map((message) => [message.id, message]));
-      conversations[index].messages = conversations[index].messages.map((message) => updates.has(message.id) ? updates.get(message.id) : message);
-      conversations[index].updatedAt = now(); await saveConversations(conversations); conversation = conversations[index];
-    });
+    // Pending image messages are already durable. Reconciliation creates each job with the
+    // stable message idempotency key so Forge enqueue latency never holds up the text turn.
     return response(200, { ok: true, conversation });
   }));
 
@@ -277,8 +263,22 @@ export async function activate(context) {
       const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
       if (index < 0) fail('conversation_not_found', 404);
       const updates = new Map(pending.map((message) => [message.id, message]));
-      conversations[index].messages = conversations[index].messages.map((message) => updates.has(message.id) ? updates.get(message.id) : message);
-      conversations[index].updatedAt = now(); await saveConversations(conversations); conversation = conversations[index];
+      let changed = false;
+      conversations[index].messages = conversations[index].messages.map((message) => {
+        const update = updates.get(message.id);
+        // Reconcile results are snapshots taken before Forge I/O. Only a still-pending
+        // message may accept one, so a stale request can never regress terminal state.
+        if (!update || message.status !== 'pending') return message;
+        // Once a job receipt is persisted, do not replace it with a stale/different job.
+        if (message.jobId && message.jobId !== update.jobId) return message;
+        changed = true;
+        return update;
+      });
+      if (changed) {
+        conversations[index].updatedAt = now();
+        await saveConversations(conversations);
+      }
+      conversation = conversations[index];
     });
     return response(200, { ok: true, conversation });
   }));
