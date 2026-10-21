@@ -1,5 +1,7 @@
 # Burrow Theater
 
+![Burrow Theater — New role. Same bad influence.](docs/assets/hero.png)
+
 **New role. Same bad influence.**
 
 Burrow Theater is an optional lightweight roleplay mod for Burrow: a private stage for character conversation using any configured text model, including local models that do not support tools.
