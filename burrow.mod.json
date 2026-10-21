@@ -1,7 +1,7 @@
 {
   "id": "burrow-theater",
   "name": "Burrow Theater",
-  "version": "2026.10.21.9",
+  "version": "2026.10.21.10",
   "server": "server/index.mjs",
   "ui": {
     "control": "ui/control.js",
