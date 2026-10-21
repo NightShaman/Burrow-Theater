@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
 
 const FICTION_BOUNDARY = 'This is a fictional roleplay conversation. Remain within the fiction and never claim to have used tools, accessed systems, or completed real-world actions. Do not introduce operational agent work, tool calls, workspace context, task state, or runtime proof behavior.';
-const MAX = Object.freeze({ name: 120, soul: 48000, message: 24000, transcript: 400, outputTokens: 8192 });
+const IMAGE_DIRECTIVE = Object.freeze({
+  open: '<!-- BURROW_FORGE_IMAGE ',
+  close: ' -->',
+  prompt: `# Optional image direction\nYou may request one image for your reply. This is not a tool call. If an image would genuinely add to the scene, append exactly one directive on its own final line using this exact form:\n<!-- BURROW_FORGE_IMAGE {\"prompt\":\"A complete standalone image prompt\"} -->\nThe JSON must contain only the string key \"prompt\". Do not mention the directive or image generation in your prose. Omit it entirely when an image would not help.`
+});
+const MAX = Object.freeze({ name: 120, soul: 48000, message: 24000, imagePrompt: 4000, transcript: 400, outputTokens: 8192 });
 const DEFAULT_ROLE = Object.freeze({
   id: 'house-goblin',
   name: 'The House Goblin',
@@ -48,11 +53,30 @@ function validateRole(body, existing = {}) {
 }
 function normalizeConversation(conversation) {
   const roleIds = Array.isArray(conversation.roleIds) && conversation.roleIds.length ? conversation.roleIds : [conversation.roleId];
-  return { ...conversation, roleIds, roleId: roleIds[0], messages: (conversation.messages || []).map((message) =>
+  return { ...conversation, allowForgeImages: conversation.allowForgeImages === true, roleIds, roleId: roleIds[0], messages: (conversation.messages || []).map((message) =>
     message.role === 'assistant' && !message.roleId ? { ...message, roleId: conversation.roleId || roleIds[0] } : message) };
 }
+function parseImageDirective(value) {
+  const source = String(value || '');
+  const escapedOpen = IMAGE_DIRECTIVE.open.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escapedClose = IMAGE_DIRECTIVE.close.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = source.match(new RegExp(`(?:^|\\n)\\s*${escapedOpen}(\\{[^\\n]*\\})${escapedClose}\\s*$`));
+  if (!match) return { content: source.trim(), prompt: null };
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (!plain(parsed) || Object.keys(parsed).length !== 1 || typeof parsed.prompt !== 'string') return { content: source.trim(), prompt: null };
+    const prompt = parsed.prompt.trim();
+    if (!prompt || prompt.length > MAX.imagePrompt) return { content: source.trim(), prompt: null };
+    return { content: source.slice(0, match.index).trim(), prompt };
+  } catch { return { content: source.trim(), prompt: null }; }
+}
+function projectImageJob(message, job) {
+  const completed = job?.status === 'succeeded' && Array.isArray(job.artifacts) && job.artifacts.some((artifact) => artifact?.previewUrl);
+  const pending = ['queued', 'running'].includes(job?.status);
+  return { ...message, status: completed ? 'completed' : pending ? 'pending' : 'failed', jobId: job?.id || message.jobId || null, previewUrl: completed ? job.artifacts.find((artifact) => artifact?.previewUrl).previewUrl : null, error: !completed && !pending ? (job?.error || 'Image generation failed.') : null, updatedAt: now() };
+}
 function validateConversation(body, existing = {}) {
-  if (!plain(body) || Object.keys(body).some((key) => !['roleId', 'roleIds', 'connectionId', 'model', 'title', 'effort', 'temperature'].includes(key))) fail('conversation_invalid');
+  if (!plain(body) || Object.keys(body).some((key) => !['roleId', 'roleIds', 'connectionId', 'model', 'title', 'effort', 'temperature', 'allowForgeImages'].includes(key))) fail('conversation_invalid');
   const participants = body.roleIds !== undefined ? body.roleIds : body.roleId !== undefined ? [body.roleId] : existing.roleIds || [existing.roleId];
   if (!Array.isArray(participants) || !participants.length || participants.length >= MAX.transcript) fail('role_ids_invalid');
   const roleIds = participants.map((value) => id(value, 'role_id'));
@@ -62,8 +86,10 @@ function validateConversation(body, existing = {}) {
   if (effort != null && (typeof effort !== 'string' || !['off', 'minimal', 'low', 'medium', 'high', 'ultra', 'xhigh', 'max'].includes(effort))) fail('model_reasoning_effort_invalid');
   const temperature = body.temperature === undefined ? existing.temperature : body.temperature;
   if (temperature != null && (typeof temperature !== 'number' || !Number.isFinite(temperature) || temperature < 0 || temperature > 2)) fail('model_temperature_invalid');
+  const allowForgeImages = body.allowForgeImages === undefined ? existing.allowForgeImages === true : body.allowForgeImages;
+  if (typeof allowForgeImages !== 'boolean') fail('allow_forge_images_invalid');
   return {
-    roleIds, roleId: roleIds[0],
+    roleIds, roleId: roleIds[0], allowForgeImages,
     connectionId: text(body.connectionId ?? existing.connectionId, 'connection_id', 128, { required: true }),
     model: text(body.model ?? existing.model, 'model', 256, { required: true }),
     title: text(body.title ?? existing.title, 'title', MAX.name),
@@ -83,9 +109,9 @@ function generationControls(conversation, model) {
   return controls;
 }
 function buildPrompt(role, conversation, roles) {
-  const transcript = conversation.messages.map((message) => `${message.role === 'user' ? 'Operator' : message.roleName || roles.find((item) => item.id === message.roleId)?.name || message.roleId || 'Role'}:\n${message.content}`).join('\n\n');
+  const transcript = conversation.messages.filter((message) => message.type !== 'forge_image').map((message) => `${message.role === 'user' ? 'Operator' : message.roleName || roles.find((item) => item.id === message.roleId)?.name || message.roleId || 'Role'}:\n${message.content}`).join('\n\n');
   const cast = conversation.roleIds.map((roleId) => roles.find((item) => item.id === roleId)?.name || roleId).join(', ');
-  return [role.soul, `# Theater boundary\n${FICTION_BOUNDARY}`, `# Participants\n${cast}\nReply only as ${role.name}.`, '# Conversation', transcript, `${role.name}:`].filter(Boolean).join('\n\n');
+  return [role.soul, `# Theater boundary\n${FICTION_BOUNDARY}`, conversation.allowForgeImages ? IMAGE_DIRECTIVE.prompt : '', `# Participants\n${cast}\nReply only as ${role.name}.`, '# Conversation', transcript, `${role.name}:`].filter(Boolean).join('\n\n');
 }
 
 export async function activate(context) {
@@ -126,7 +152,9 @@ export async function activate(context) {
         // Operator display identity is optional; chat still works without it.
       }
     }
-    return response(200, { ok: true, boundary: FICTION_BOUNDARY, operator, models: await context.models.list(), roles: await readRoles(), conversations: await readConversations() });
+    let forgeImages = { available: false, reason: 'Forge images are unavailable.' };
+    try { forgeImages = await context.forge.images.status(); } catch { /* Optional capability: Theater remains usable without it. */ }
+    return response(200, { ok: true, boundary: FICTION_BOUNDARY, operator, forgeImages, models: await context.models.list(), roles: await readRoles(), conversations: await readConversations() });
   }));
 
   context.api.post('/roles', route(async ({ body }) => serial(async () => {
@@ -179,7 +207,8 @@ export async function activate(context) {
       if (!current) fail('conversation_not_found', 404);
       snapshot = JSON.stringify(current);
       conversation = clone(current);
-      if (conversation.messages.length + 1 + conversation.roleIds.length > MAX.transcript) fail('conversation_message_limit', 409);
+      const reservedReplies = conversation.roleIds.length * (conversation.allowForgeImages ? 2 : 1);
+      if (conversation.messages.length + 1 + reservedReplies > MAX.transcript) fail('conversation_message_limit', 409);
       roles = await readRoles();
       if (conversation.roleIds.some((roleId) => !roles.some((item) => item.id === roleId))) fail('role_not_found', 404);
       const model = (await context.models.list()).find((item) => item.connectionId === conversation.connectionId && item.model === conversation.model);
@@ -191,22 +220,71 @@ export async function activate(context) {
     for (const roleId of conversation.roleIds) {
       const role = roles.find((item) => item.id === roleId);
       const generated = await context.models.generateText({ connectionId: conversation.connectionId, model: conversation.model, prompt: buildPrompt(role, conversation, roles), maxTokens, tools: null, ...controls });
-      const reply = text(generated?.text, 'generated_text', MAX.message, { required: true });
-      conversation.messages.push({ id: randomUUID(), role: 'assistant', roleId, roleName: role.name, content: reply, createdAt: now() });
+      const rawReply = text(generated?.text, 'generated_text', MAX.message, { required: true });
+      const parsed = conversation.allowForgeImages ? parseImageDirective(rawReply) : { content: rawReply, prompt: null };
+      if (parsed.content) conversation.messages.push({ id: randomUUID(), role: 'assistant', roleId, roleName: role.name, content: parsed.content, createdAt: now() });
+      if (parsed.prompt) {
+        const timestamp = now();
+        conversation.messages.push({ id: randomUUID(), type: 'forge_image', role: 'assistant', roleId, roleName: role.name, content: '', prompt: parsed.prompt, status: 'pending', jobId: null, previewUrl: null, error: null, createdAt: timestamp, updatedAt: timestamp });
+      }
     }
-    return serial(async () => {
+    await serial(async () => {
       const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
       if (index < 0) fail('conversation_not_found', 404);
       const currentRoles = await readRoles();
       if (JSON.stringify(conversations[index]) !== snapshot || conversation.roleIds.some((roleId) =>
         JSON.stringify(currentRoles.find((item) => item.id === roleId)) !== JSON.stringify(roles.find((item) => item.id === roleId)))) fail('conversation_changed_during_generation', 409);
       conversation.updatedAt = now(); conversations[index] = conversation; await saveConversations(conversations);
-      return response(200, { ok: true, conversation });
     });
+    const imageMessages = conversation.messages.filter((message) => message.type === 'forge_image' && message.status === 'pending' && !message.jobId);
+    for (const image of imageMessages) {
+      try {
+        const created = await context.forge.images.create({ prompt: image.prompt, idempotencyKey: `message-${image.id}` });
+        Object.assign(image, projectImageJob(image, created.job));
+      } catch (error) {
+        context.logger.warn('Burrow Theater could not create Forge image job', { conversationId, messageId: image.id, error: error instanceof Error ? error.message : 'unknown' });
+      }
+    }
+    if (imageMessages.length) await serial(async () => {
+      const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
+      if (index < 0) fail('conversation_not_found', 404);
+      const updates = new Map(imageMessages.map((message) => [message.id, message]));
+      conversations[index].messages = conversations[index].messages.map((message) => updates.has(message.id) ? updates.get(message.id) : message);
+      conversations[index].updatedAt = now(); await saveConversations(conversations); conversation = conversations[index];
+    });
+    return response(200, { ok: true, conversation });
+  }));
+
+  context.api.post('/conversations/:id/forge/reconcile', route(async ({ params }) => {
+    const conversationId = id(params.id);
+    let conversation = await serial(async () => {
+      const current = (await readConversations()).find((item) => item.id === conversationId);
+      if (!current) fail('conversation_not_found', 404);
+      return clone(current);
+    });
+    const pending = conversation.messages.filter((message) => message.type === 'forge_image' && message.status === 'pending');
+    for (const image of pending) {
+      try {
+        const job = image.jobId
+          ? await context.forge.jobs.read(image.jobId)
+          : (await context.forge.images.create({ prompt: image.prompt, idempotencyKey: `message-${image.id}` })).job;
+        Object.assign(image, projectImageJob(image, job));
+      } catch (error) {
+        context.logger.warn('Burrow Theater could not reconcile Forge image job', { conversationId, messageId: image.id, error: error instanceof Error ? error.message : 'unknown' });
+      }
+    }
+    if (pending.length) await serial(async () => {
+      const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
+      if (index < 0) fail('conversation_not_found', 404);
+      const updates = new Map(pending.map((message) => [message.id, message]));
+      conversations[index].messages = conversations[index].messages.map((message) => updates.has(message.id) ? updates.get(message.id) : message);
+      conversations[index].updatedAt = now(); await saveConversations(conversations); conversation = conversations[index];
+    });
+    return response(200, { ok: true, conversation });
   }));
 
   context.logger.info('Burrow Theater activated');
   return () => context.logger.info('Burrow Theater stopped');
 }
 
-export const theaterContract = Object.freeze({ FICTION_BOUNDARY, MAX, DEFAULT_ROLE });
+export const theaterContract = Object.freeze({ FICTION_BOUNDARY, IMAGE_DIRECTIVE, MAX, DEFAULT_ROLE, parseImageDirective });

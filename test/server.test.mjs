@@ -4,16 +4,18 @@ import { activate, theaterContract } from '../server/index.mjs';
 
 function fixture() {
   const routes = new Map(); const settings = new Map(); const logs = [];
-  const models = [{ connectionId: 'local', model: 'stheno', provider: 'ollama' }]; const generations = [];
+  const models = [{ connectionId: 'local', model: 'stheno', provider: 'ollama' }]; const generations = []; const forgeCreates = []; const forgeJobs = new Map();
   const context = {
     api: Object.fromEntries(['get', 'post', 'put', 'patch', 'delete'].map((method) => [method, (path, handler) => routes.set(`${method.toUpperCase()} ${path}`, handler)])),
     settings: { get: async (name, fallback = null) => settings.has(name) ? structuredClone(settings.get(name)) : fallback, set: async (name, value) => (settings.set(name, structuredClone(value)), value), delete: async (name) => settings.delete(name) },
     models: { list: async () => models, generateText: async (input) => (generations.push(input), { text: '*The curtain rises.* Welcome.' }) },
+    forge: { images: { status: async () => ({ available: true }), create: async (input) => { forgeCreates.push(structuredClone(input)); const job = { id: `job-${forgeCreates.length}`, kind: 'image', status: 'queued', artifacts: [], error: null, createdAt: now, updatedAt: now }; forgeJobs.set(job.id, job); return { job, replayed: false }; } }, jobs: { read: async (jobId) => { const job = forgeJobs.get(jobId); if (!job) throw Error('forge_job_not_found'); return structuredClone(job); } } },
     operator: { displayIdentity: async () => ({ id: 'operator', name: 'Rob' }) },
     logger: Object.fromEntries(['debug', 'info', 'warn', 'error'].map((level) => [level, (...args) => logs.push([level, ...args])]))
   };
-  return { context, routes, settings, models, generations, logs };
+  return { context, routes, settings, models, generations, forgeCreates, forgeJobs, logs };
 }
+const now = '2026-10-21T12:00:00.000Z';
 const req = (body = {}, params = {}, auth = { enabled: true, authenticated: true }) => ({ body, params, auth, query: {}, headers: {} });
 
 async function createConversation(f, roleId = 'house-goblin') {
@@ -22,7 +24,7 @@ async function createConversation(f, roleId = 'house-goblin') {
 
 test('activation exposes only SOUL role and conversation routes with no agent tools', async () => {
   const f = fixture(); const cleanup = await activate(f.context);
-  assert.deepEqual([...f.routes.keys()], ['GET /bootstrap', 'POST /roles', 'PUT /roles/:id', 'DELETE /roles/:id', 'POST /conversations', 'PUT /conversations/:id', 'POST /conversations/:id/turn']);
+  assert.deepEqual([...f.routes.keys()], ['GET /bootstrap', 'POST /roles', 'PUT /roles/:id', 'DELETE /roles/:id', 'POST /conversations', 'PUT /conversations/:id', 'POST /conversations/:id/turn', 'POST /conversations/:id/forge/reconcile']);
   cleanup(); assert.deepEqual(f.logs.map((item) => item[1]), ['Burrow Theater activated', 'Burrow Theater stopped']);
 });
 
@@ -170,4 +172,55 @@ test('overlapping turns cannot overwrite a completed turn', async () => {
   assert.equal((await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Second' }, { id: conversationId }))).status, 200);
   release(); assert.equal((await first).status, 409);
   assert.equal(f.settings.get('conversations')[0].messages[0].content, 'Second');
+});
+
+
+test('Forge images default off and the switch persists per conversation', async () => {
+  const f = fixture(); await activate(f.context); const created = await createConversation(f); const conversationId = created.body.conversation.id;
+  assert.equal(created.body.conversation.allowForgeImages, false);
+  assert.equal((await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: 'yes' }, { id: conversationId }))).status, 400);
+  const updated = await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id: conversationId }));
+  assert.equal(updated.body.conversation.allowForgeImages, true); assert.equal(f.settings.get('conversations')[0].allowForgeImages, true);
+});
+
+test('enabled turns parse strict image directives, create durable jobs, and hide directives from prose', async () => {
+  const f = fixture(); await activate(f.context); const created = await createConversation(f); const conversationId = created.body.conversation.id;
+  await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id: conversationId }));
+  f.context.models.generateText = async input => (f.generations.push(input), { text: 'Behold the stage.\n<!-- BURROW_FORGE_IMAGE {"prompt":"A moonlit goblin theater, wide shot"} -->' });
+  const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Show me.' }, { id: conversationId }));
+  assert.equal(turn.status, 200); assert.match(f.generations[0].prompt, /BURROW_FORGE_IMAGE/); assert.equal(f.generations[0].tools, null);
+  assert.equal(turn.body.conversation.messages[1].content, 'Behold the stage.'); assert.doesNotMatch(turn.body.conversation.messages[1].content, /FORGE_IMAGE/);
+  const image = turn.body.conversation.messages[2]; assert.equal(image.type, 'forge_image'); assert.equal(image.roleId, 'house-goblin'); assert.equal(image.status, 'pending'); assert.equal(image.jobId, 'job-1');
+  assert.deepEqual(f.forgeCreates, [{ prompt: 'A moonlit goblin theater, wide shot', idempotencyKey: `message-${image.id}` }]);
+  f.forgeJobs.set(image.jobId, { ...f.forgeJobs.get(image.jobId), status: 'succeeded', artifacts: [{ id: 'a1', previewUrl: '/api/forge/jobs/job-1/artifacts/a1' }] });
+  const reconciled = await f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id: conversationId }));
+  const completed = reconciled.body.conversation.messages[2]; assert.equal(completed.status, 'completed'); assert.equal(completed.previewUrl, '/api/forge/jobs/job-1/artifacts/a1');
+  assert.equal(f.settings.get('conversations')[0].messages[2].status, 'completed');
+});
+
+test('invalid image directives remain prose and do not create jobs', async () => {
+  const f = fixture(); await activate(f.context); const created = await createConversation(f); const id = created.body.conversation.id;
+  await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id }));
+  f.context.models.generateText = async () => ({ text: 'Nope\n<!-- BURROW_FORGE_IMAGE {"prompt":"x","model":"secret"} -->' });
+  const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Hello' }, { id }));
+  assert.equal(turn.body.conversation.messages.length, 2); assert.match(turn.body.conversation.messages[1].content, /FORGE_IMAGE/); assert.equal(f.forgeCreates.length, 0);
+});
+
+test('group image directives preserve role attribution and are excluded from later role prompts', async () => {
+  const f = await groupFixture(); const created = await groupCreate(f, { allowForgeImages: true }); let call = 0;
+  f.context.models.generateText = async input => { f.generations.push(input); return call++ === 0 ? { text: 'First.\n<!-- BURROW_FORGE_IMAGE {"prompt":"First role scene"} -->' } : { text: 'Second.' }; };
+  const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Perform' }, { id: created.body.conversation.id }));
+  assert.equal(turn.status, 200); const image = turn.body.conversation.messages.find(message => message.type === 'forge_image'); assert.equal(image.roleId, f.roleIds[0]);
+  assert.doesNotMatch(f.generations[1].prompt, /First role scene|BURROW_FORGE_IMAGE \{"prompt":"First role scene/); assert.match(f.generations[1].prompt, /First\./);
+});
+
+test('failed Forge creation and reload reconciliation persist attributed terminal state', async () => {
+  const f = fixture(); await activate(f.context); const created = await createConversation(f); const id = created.body.conversation.id;
+  await f.routes.get('PUT /conversations/:id')(req({ allowForgeImages: true }, { id }));
+  f.context.models.generateText = async () => ({ text: 'Scene.\n<!-- BURROW_FORGE_IMAGE {"prompt":"A scene"} -->' });
+  f.context.forge.images.create = async () => { throw Error('forge_unavailable'); };
+  const turn = await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Hello' }, { id })); const image = turn.body.conversation.messages[2];
+  assert.equal(image.status, 'pending'); assert.equal(image.jobId, null); assert.equal(image.roleId, 'house-goblin'); assert.equal(f.settings.get('conversations')[0].messages[2].status, 'pending');
+  f.context.forge.images.create = async input => { f.forgeCreates.push(input); const job = { id: 'job-recovered', status: 'failed', artifacts: [], error: 'provider_failed' }; f.forgeJobs.set(job.id, job); return { job, replayed: false }; };
+  const retried = await f.routes.get('POST /conversations/:id/forge/reconcile')(req({}, { id })); assert.equal(retried.body.conversation.messages[2].status, 'failed'); assert.equal(retried.body.conversation.messages[2].jobId, 'job-recovered');
 });
