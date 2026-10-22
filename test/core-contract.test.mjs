@@ -25,7 +25,7 @@ test('current Burrow Core discovers and hosts Burrow Theater with durable model 
   await fs.cp(root, path.join(modsRoot, 'burrow-theater'), { recursive: true, filter: source => path.basename(source) !== '.git' });
   t.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
   const [mod] = await discoverMods({ runtimeRoot, logger: { warn() {} } });
-  assert.equal(mod.id, 'burrow-theater'); assert.notEqual(mod.status, 'failed', mod.error);
+  assert.equal(mod.id, 'burrow-theater'); assert.equal(mod.name, 'Theater'); assert.notEqual(mod.status, 'failed', mod.error);
   assert.deepEqual(Object.keys(mod.ui), ['control', 'settings']);
   assert.equal(mod.contributions.settings[0].id, 'roles');
   assert.equal(mod.contributions.settings[0].primary.capability, 'settingsUi');

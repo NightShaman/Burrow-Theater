@@ -16,7 +16,7 @@ Theater uses Burrow’s existing model connections. There is no separate provide
 
 Use **Settings → Mods → Mod sources** to install the Theater source supplied for your release, then explicitly enable the mod. Its manifest ID is `burrow-theater`; its display name is **Burrow Theater**.
 
-Open Theater’s control view for conversations. Open **Settings → Burrow Theater → Roles** to manage its saved identities.
+Open Theater’s control view for conversations. Open **Settings → Theater → Roles** to manage its saved identities.
 
 A fresh role inventory supplies **The House Goblin**. You can use that role immediately or create your own. If you deliberately remove every saved role, Theater leaves the inventory empty instead of silently recreating the default.
 

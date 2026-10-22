@@ -4,7 +4,7 @@ A role has **Role name**, **SOUL**, and an optional **Allow Forge images** setti
 
 ## Create a role
 
-1. Open **Settings → Burrow Theater → Roles**.
+1. Open **Settings → Theater → Roles**.
 2. Choose **New role**.
 3. Enter a name and SOUL.
 4. Optionally enable **Allow Forge images** for this role when Forge is available.

@@ -4,7 +4,7 @@
 
 ## Turn images on
 
-1. Open **Settings → Burrow Theater → Roles**.
+1. Open **Settings → Theater → Roles**.
 2. Select the role under **Saved roles**.
 3. Enable **Allow Forge images**.
 4. Choose **Save role**, then return to the conversation.
