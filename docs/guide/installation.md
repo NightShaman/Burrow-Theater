@@ -2,9 +2,7 @@
 
 ## Release availability
 
-:::note Upcoming release preview
-Checked October 21, 2026: an installable public Theater release and a compatible public Core version have not yet been verified. This guide describes Theater 2026.10.21.12, including per-role Forge images. Wait for the coordinated public release before following the installation steps below.
-:::
+These guides describe the current Theater implementation, including per-role Forge images. Public snapshots follow the daily sync, so documentation can lead an installed release by one day. Install a tagged Theater release with compatible Core support; if an expected feature is missing, check both versions after the sync.
 
 ## What you need
 

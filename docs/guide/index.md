@@ -8,9 +8,7 @@ Burrow Theater is a place for fictional conversations. Give a role a name and a 
 
 Theater keeps the familiar chat layout without bringing along agent tools, workspace context, tasks, Brains, handoffs, or subagents. Each role receives its SOUL, a fiction boundary, the cast’s names, and the conversation’s text. Optional Forge images can illustrate the scene.
 
-:::note Upcoming release preview
-This guide covers Theater 2026.10.21.12. The public installation source and compatible public Core release have not yet been verified. See [release availability](installation.md#release-availability) before installing.
-:::
+See [setup and release availability](installation.md#release-availability) for installation and daily-sync timing.
 
 ## Start here
 
