@@ -62,6 +62,23 @@ function normalizeConversation(conversation) {
   return { ...rest, roleIds, roleId: roleIds[0], messages: (conversation.messages || []).map((message) =>
     message.role === 'assistant' && !message.roleId ? { ...message, roleId: conversation.roleId || roleIds[0] } : message) };
 }
+function publicConversation(conversation) {
+  return { ...conversation, messages: (conversation.messages || []).map(({ generationRequest, turnSnapshot, ...message }) => message) };
+}
+function generationPending(conversation) {
+  return conversation.messages.some((message) => message.type === 'text_generation' && message.status === 'pending');
+}
+function generationMessage({ role, generationRequest, turnSnapshot }) {
+  const timestamp = now();
+  return { id: randomUUID(), type: 'text_generation', role: 'assistant', roleId: role.id, roleName: role.name,
+    content: '', status: 'pending', jobId: null, error: null, generationRequest, turnSnapshot,
+    createdAt: timestamp, updatedAt: timestamp };
+}
+function projectGeneration(message, job) {
+  const pending = ['queued', 'running'].includes(job?.status);
+  return { ...message, status: pending ? 'pending' : job?.status === 'succeeded' ? 'completed' : 'failed',
+    jobId: job?.id || message.jobId || null, error: pending || job?.status === 'succeeded' ? null : (job?.error || 'Reply generation failed.'), updatedAt: now() };
+}
 function parseImageDirective(value) {
   const source = String(value || '');
   const escapedOpen = IMAGE_DIRECTIVE.open.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -158,7 +175,7 @@ export async function activate(context) {
     }
     let forgeImages = { available: false, reason: 'Forge images are unavailable.' };
     try { forgeImages = await context.forge.images.status(); } catch { /* Optional capability: Theater remains usable without it. */ }
-    return response(200, { ok: true, boundary: FICTION_BOUNDARY, operator, forgeImages, models: await context.models.list(), roles: await readRoles(), conversations: await readConversations() });
+    return response(200, { ok: true, boundary: FICTION_BOUNDARY, operator, forgeImages, models: await context.models.list(), roles: await readRoles(), conversations: (await readConversations()).map(publicConversation) });
   }));
 
   context.api.post('/roles', route(async ({ body }) => serial(async () => {
@@ -170,6 +187,7 @@ export async function activate(context) {
   context.api.put('/roles/:id', route(async ({ params, body }) => serial(async () => {
     const roleId = id(params.id); const roles = await readRoles(); const index = roles.findIndex((item) => item.id === roleId);
     if (index < 0) fail('role_not_found', 404);
+    if ((await readConversations()).some((item) => item.roleIds.includes(roleId) && generationPending(item))) fail('conversation_turn_in_progress', 409);
     roles[index] = { ...roles[index], ...validateRole(body, roles[index]), updatedAt: now() }; await saveRoles(roles);
     return response(200, { ok: true, role: roles[index] });
   })));
@@ -188,62 +206,114 @@ export async function activate(context) {
     const defaultTitle = values.roleIds.map((roleId) => roles.find((item) => item.id === roleId)?.name).filter(Boolean).join(', ');
     const conversation = { id: randomUUID(), ...values, title: values.title || defaultTitle || role.name, messages: [], createdAt: timestamp, updatedAt: timestamp };
     const conversations = await readConversations(); conversations.unshift(conversation); await saveConversations(conversations);
-    return response(201, { ok: true, conversation });
+    return response(201, { ok: true, conversation: publicConversation(conversation) });
   })));
   context.api.put('/conversations/:id', route(async ({ params, body }) => serial(async () => {
     const conversationId = id(params.id); const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
     if (index < 0) fail('conversation_not_found', 404);
     const values = validateConversation(body, conversations[index]);
     await validateSelection(values, body, conversations[index]);
+    if (generationPending(conversations[index])) fail('conversation_turn_in_progress', 409);
     conversations[index] = { ...conversations[index], ...values, title: values.title || conversations[index].title, updatedAt: now() };
     await saveConversations(conversations);
-    return response(200, { ok: true, conversation: conversations[index] });
+    return response(200, { ok: true, conversation: publicConversation(conversations[index]) });
   })));
-  context.api.post('/conversations/:id/turn', route(async ({ params, body }) => {
+  context.api.post('/conversations/:id/turn', route(async ({ params, body }) => serial(async () => {
     const conversationId = id(params.id);
     if (!plain(body) || Object.keys(body).some((key) => !['content', 'maxTokens'].includes(key))) fail('turn_invalid');
     const content = text(body.content, 'message', MAX.message, { required: true });
     const maxTokens = body.maxTokens === undefined ? 1200 : body.maxTokens;
     if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > MAX.outputTokens) fail('max_tokens_invalid');
-    let conversation; let roles; let snapshot; let controls;
-    await serial(async () => {
-      const conversations = await readConversations(); const current = conversations.find((item) => item.id === conversationId);
+    const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
+    if (index < 0) fail('conversation_not_found', 404);
+    const conversation = clone(conversations[index]);
+    if (generationPending(conversation)) fail('conversation_turn_in_progress', 409);
+    const roles = await readRoles();
+    const selectedRoles = conversation.roleIds.map((roleId) => roles.find((item) => item.id === roleId));
+    if (selectedRoles.some((role) => !role)) fail('role_not_found', 404);
+    const enabledImageRoles = selectedRoles.filter((role) => role.allowForgeImages === true).length;
+    if (conversation.messages.length + 1 + selectedRoles.length + enabledImageRoles > MAX.transcript) fail('conversation_message_limit', 409);
+    const model = (await context.models.list()).find((item) => item.connectionId === conversation.connectionId && item.model === conversation.model);
+    if (!model) fail('model_not_found', 404);
+    const controls = generationControls(conversation, model);
+    conversation.messages.push({ id: randomUUID(), role: 'user', content, createdAt: now() });
+    const firstRole = selectedRoles[0];
+    const turnSnapshot = { roles: selectedRoles.map(clone), nextRoleIndex: 1, completedMessages: [], connectionId: conversation.connectionId,
+      model: conversation.model, maxTokens, controls: clone(controls) };
+    conversation.messages.push(generationMessage({ role: firstRole,
+      generationRequest: { connectionId: conversation.connectionId, model: conversation.model,
+        prompt: buildPrompt(firstRole, conversation, selectedRoles), maxTokens, ...controls }, turnSnapshot }));
+    conversation.updatedAt = now(); conversations[index] = conversation; await saveConversations(conversations);
+    return response(202, { ok: true, conversation: publicConversation(conversation) });
+  })));
+
+  context.api.post('/conversations/:id/generation/reconcile', route(async ({ params }) => {
+    const conversationId = id(params.id);
+    let conversation = await serial(async () => {
+      const current = (await readConversations()).find((item) => item.id === conversationId);
       if (!current) fail('conversation_not_found', 404);
-      snapshot = JSON.stringify(current);
-      conversation = clone(current);
-      roles = await readRoles();
-      const enabledImageRoles = conversation.roleIds.filter((roleId) => roles?.find((item) => item.id === roleId)?.allowForgeImages === true).length;
-      const reservedReplies = conversation.roleIds.length + enabledImageRoles;
-      if (conversation.messages.length + 1 + reservedReplies > MAX.transcript) fail('conversation_message_limit', 409);
-      if (conversation.roleIds.some((roleId) => !roles.some((item) => item.id === roleId))) fail('role_not_found', 404);
-      const model = (await context.models.list()).find((item) => item.connectionId === conversation.connectionId && item.model === conversation.model);
-      if (!model) fail('model_not_found', 404);
-      controls = generationControls(conversation, model);
-      conversation.messages.push({ id: randomUUID(), role: 'user', content, createdAt: now() });
+      return clone(current);
     });
-    // Sequential generation lets each participant hear the preceding replies. Commit the whole turn atomically.
-    for (const roleId of conversation.roleIds) {
-      const role = roles.find((item) => item.id === roleId);
-      const generated = await context.models.generateText({ connectionId: conversation.connectionId, model: conversation.model, prompt: buildPrompt(role, conversation, roles), maxTokens, tools: null, ...controls });
-      const rawReply = text(generated?.text, 'generated_text', MAX.message, { required: true });
-      const parsed = role.allowForgeImages ? parseImageDirective(rawReply) : { content: rawReply, prompt: null };
-      if (parsed.content) conversation.messages.push({ id: randomUUID(), role: 'assistant', roleId, roleName: role.name, content: parsed.content, createdAt: now() });
-      if (parsed.prompt) {
-        const timestamp = now();
-        conversation.messages.push({ id: randomUUID(), type: 'forge_image', role: 'assistant', roleId, roleName: role.name, content: '', prompt: parsed.prompt, status: 'pending', jobId: null, previewUrl: null, error: null, createdAt: timestamp, updatedAt: timestamp });
+    const pending = conversation.messages.find((message) => message.type === 'text_generation' && message.status === 'pending');
+    if (!pending) return response(200, { ok: true, conversation: publicConversation(conversation) });
+    let update = pending;
+    try {
+      const job = pending.jobId
+        ? await context.models.generations.read(pending.jobId)
+        : (await context.models.generations.submit({ ...pending.generationRequest, idempotencyKey: `message-${pending.id}` })).job;
+      update = projectGeneration(pending, job);
+      if (job.status === 'succeeded') {
+        const rawReply = text(job.text, 'generated_text', MAX.message, { required: true });
+        const role = pending.turnSnapshot.roles.find((item) => item.id === pending.roleId);
+        const parsed = role.allowForgeImages ? parseImageDirective(rawReply) : { content: rawReply, prompt: null };
+        const replacement = [];
+        if (parsed.content) replacement.push({ id: randomUUID(), role: 'assistant', roleId: role.id, roleName: role.name, content: parsed.content, createdAt: now() });
+        if (parsed.prompt) {
+          const timestamp = now();
+          replacement.push({ id: randomUUID(), type: 'forge_image', role: 'assistant', roleId: role.id, roleName: role.name,
+            content: '', prompt: parsed.prompt, status: 'pending', jobId: null, previewUrl: null, error: null, createdAt: timestamp, updatedAt: timestamp });
+        }
+        await serial(async () => {
+          const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
+          if (index < 0) fail('conversation_not_found', 404);
+          const messageIndex = conversations[index].messages.findIndex((message) => message.id === pending.id && message.status === 'pending');
+          if (messageIndex < 0) { conversation = conversations[index]; return; }
+          const snapshot = pending.turnSnapshot;
+          const completedMessages = [...(snapshot.completedMessages || []), ...replacement];
+          if (snapshot.nextRoleIndex < snapshot.roles.length) {
+            const nextRole = snapshot.roles[snapshot.nextRoleIndex];
+            const promptConversation = clone(conversations[index]);
+            promptConversation.messages.splice(messageIndex, 1, ...completedMessages);
+            const nextSnapshot = { ...snapshot, nextRoleIndex: snapshot.nextRoleIndex + 1, completedMessages };
+            const nextMessage = generationMessage({ role: nextRole,
+              generationRequest: { connectionId: snapshot.connectionId, model: snapshot.model,
+                prompt: buildPrompt(nextRole, promptConversation, snapshot.roles), maxTokens: snapshot.maxTokens, ...snapshot.controls },
+              turnSnapshot: nextSnapshot });
+            conversations[index].messages.splice(messageIndex, 1, nextMessage);
+          } else {
+            // Group replies become visible together only after every participant
+            // succeeds; a later failure can never leave a half-committed cast turn.
+            conversations[index].messages.splice(messageIndex, 1, ...completedMessages);
+          }
+          conversations[index].updatedAt = now(); await saveConversations(conversations); conversation = conversations[index];
+        });
+        return response(200, { ok: true, conversation: publicConversation(conversation) });
       }
+    } catch (error) {
+      context.logger.warn('Burrow Theater could not reconcile text generation', { conversationId, messageId: pending.id, error: error instanceof Error ? error.message : 'unknown' });
+      if (!pending.jobId) return response(200, { ok: true, conversation: publicConversation(conversation) });
+      update = { ...pending, status: 'failed', error: error instanceof Error ? error.message : 'Reply generation failed.', updatedAt: now() };
     }
     await serial(async () => {
       const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
       if (index < 0) fail('conversation_not_found', 404);
-      const currentRoles = await readRoles();
-      if (JSON.stringify(conversations[index]) !== snapshot || conversation.roleIds.some((roleId) =>
-        JSON.stringify(currentRoles.find((item) => item.id === roleId)) !== JSON.stringify(roles.find((item) => item.id === roleId)))) fail('conversation_changed_during_generation', 409);
-      conversation.updatedAt = now(); conversations[index] = conversation; await saveConversations(conversations);
+      const messageIndex = conversations[index].messages.findIndex((message) => message.id === pending.id && message.status === 'pending');
+      if (messageIndex >= 0 && (!conversations[index].messages[messageIndex].jobId || conversations[index].messages[messageIndex].jobId === update.jobId)) {
+        conversations[index].messages[messageIndex] = update; conversations[index].updatedAt = now(); await saveConversations(conversations);
+      }
+      conversation = conversations[index];
     });
-    // Pending image messages are already durable. Reconciliation creates each job with the
-    // stable message idempotency key so Forge enqueue latency never holds up the text turn.
-    return response(200, { ok: true, conversation });
+    return response(200, { ok: true, conversation: publicConversation(conversation) });
   }));
 
   context.api.post('/conversations/:id/forge/reconcile', route(async ({ params }) => {
@@ -285,7 +355,7 @@ export async function activate(context) {
       }
       conversation = conversations[index];
     });
-    return response(200, { ok: true, conversation });
+    return response(200, { ok: true, conversation: publicConversation(conversation) });
   }));
 
   context.logger.info('Burrow Theater activated');
