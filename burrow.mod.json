@@ -10,6 +10,18 @@
   "contributions": {
     "settings": [
       {
+        "id": "profile",
+        "navigation": {
+          "title": "Theater",
+          "description": "Choose how Theater roles know and address you."
+        },
+        "primary": {
+          "title": "Operator profile",
+          "description": "Manage your Theater-specific name and fictional context.",
+          "capability": "settingsUi"
+        }
+      },
+      {
         "id": "roles",
         "navigation": {
           "title": "Theater",

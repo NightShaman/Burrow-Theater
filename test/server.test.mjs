@@ -35,13 +35,13 @@ async function completeTurn(f, conversationId, content = 'Hello') {
 
 test('activation exposes only SOUL role and conversation routes with no agent tools', async () => {
   const f = fixture(); const cleanup = await activate(f.context);
-  assert.deepEqual([...f.routes.keys()], ['GET /bootstrap', 'POST /roles', 'PUT /roles/:id', 'DELETE /roles/:id', 'POST /conversations', 'PUT /conversations/:id', 'POST /conversations/:id/turn', 'POST /conversations/:id/generation/reconcile', 'POST /conversations/:id/forge/reconcile']);
+  assert.deepEqual([...f.routes.keys()], ['GET /bootstrap', 'PUT /operator-profile', 'POST /roles', 'PUT /roles/:id', 'DELETE /roles/:id', 'POST /conversations', 'PUT /conversations/:id', 'DELETE /conversations/:id', 'POST /conversations/:id/turn', 'POST /conversations/:id/generation/reconcile', 'POST /conversations/:id/forge/reconcile']);
   cleanup(); assert.deepEqual(f.logs.map((item) => item[1]), ['Burrow Theater activated', 'Burrow Theater stopped']);
 });
 
 test('bootstrap returns configured models, operator identity, default SOUL role, and conversations', async () => {
   const f = fixture(); await activate(f.context); const result = await f.routes.get('GET /bootstrap')(req());
-  assert.equal(result.status, 200); assert.deepEqual(result.body.models, f.models); assert.equal(result.body.operator.name, 'Rob');
+  assert.equal(result.status, 200); assert.deepEqual(result.body.models, f.models); assert.equal(result.body.operator.name, 'Rob'); assert.deepEqual(result.body.operatorProfile, { name: 'Rob', profile: '' });
   assert.equal(result.body.roles[0].name, 'The House Goblin'); assert.match(result.body.roles[0].soul, /# SOUL/); assert.equal(result.body.roles[0].allowForgeImages, false); assert.deepEqual(result.body.conversations, []);
 });
 
@@ -49,6 +49,20 @@ test('auth context protects Theater state when Burrow authentication is enabled'
   const f = fixture(); await activate(f.context);
   assert.equal((await f.routes.get('GET /bootstrap')(req({}, {}, { enabled: true, authenticated: false }))).status, 401);
   assert.equal((await f.routes.get('GET /bootstrap')(req({}, {}, { enabled: false, authenticated: false }))).status, 200);
+});
+
+
+test('Theater operator profile persists separately and is injected into current single and group turns', async () => {
+  const f = await groupFixture();
+  const saved = await f.routes.get('PUT /operator-profile')(req({ name: 'Goblin King', profile: '# Player\nBuilder of strange kingdoms.' }));
+  assert.equal(saved.status, 200); assert.deepEqual(saved.body.operatorProfile, { name: 'Goblin King', profile: '# Player\nBuilder of strange kingdoms.' });
+  assert.deepEqual(f.settings.get('operatorProfile'), saved.body.operatorProfile);
+  const created = await groupCreate(f); await completeTurn(f, created.body.conversation.id, 'Open the gates.');
+  assert.match(f.generations[0].prompt, /# Player\nName: Goblin King/); assert.match(f.generations[0].prompt, /Builder of strange kingdoms/); assert.match(f.generations[0].prompt, /Goblin King:\nOpen the gates/);
+  assert.match(f.generations[1].prompt, /Goblin King:\nOpen the gates/);
+  const bootstrap = await f.routes.get('GET /bootstrap')(req()); assert.equal(bootstrap.body.operator.name, 'Goblin King');
+  assert.equal((await f.routes.get('PUT /operator-profile')(req({ name: '', profile: '' }))).status, 400);
+  assert.equal((await f.routes.get('PUT /operator-profile')(req({ name: 'Valid', extra: true }))).status, 400);
 });
 
 test('roles are name plus SOUL markdown and cannot be deleted while in use', async () => {
@@ -89,6 +103,51 @@ test('conversation role and model can be changed while preserving transcript', a
   assert.equal((await f.routes.get('PUT /conversations/:id')(req({ connectionId: 'missing', model: 'nope' }, { id: conversationId }))).status, 404);
 });
 
+
+test('conversation lifecycle derives titles, supports rename/archive/restore/delete, and unlocks role deletion', async () => {
+  const f = fixture(); await activate(f.context);
+  const made = await f.routes.get('POST /roles')(req({ name: 'Mara', soul: '# SOUL\nA librarian.' }));
+  const created = await createConversation(f, made.body.role.id); const conversationId = created.body.conversation.id;
+  assert.match(created.body.conversation.title, /^Mara · .* UTC$/); assert.equal(created.body.conversation.titleSource, 'fallback'); assert.equal(created.body.conversation.archivedAt, null);
+  const accepted = await f.routes.get('POST /conversations/:id/turn')(req({ content: '**Investigate** the midnight archive and find the missing silver key.' }, { id: conversationId }));
+  assert.equal(accepted.status, 202); assert.equal(accepted.body.conversation.title, 'Investigate the midnight archive and find the missing silver key.'); assert.equal(accepted.body.conversation.titleSource, 'automatic');
+  await reconcileGeneration(f, conversationId);
+  const renamed = await f.routes.get('PUT /conversations/:id')(req({ title: 'The Silver Key' }, { id: conversationId }));
+  assert.equal(renamed.body.conversation.title, 'The Silver Key'); assert.equal(renamed.body.conversation.titleSource, 'manual');
+  const archived = await f.routes.get('PUT /conversations/:id')(req({ archived: true }, { id: conversationId }));
+  assert.ok(archived.body.conversation.archivedAt); assert.equal((await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Still there?' }, { id: conversationId }))).body.error, 'conversation_archived');
+  const restored = await f.routes.get('PUT /conversations/:id')(req({ archived: false }, { id: conversationId })); assert.equal(restored.body.conversation.archivedAt, null);
+  assert.equal((await f.routes.get('DELETE /roles/:id')(req({}, { id: made.body.role.id }))).status, 409);
+  assert.equal((await f.routes.get('DELETE /conversations/:id')(req({}, { id: conversationId }))).status, 200);
+  assert.equal((await f.routes.get('DELETE /roles/:id')(req({}, { id: made.body.role.id }))).status, 200);
+  assert.equal((await f.routes.get('DELETE /conversations/:id')(req({}, { id: conversationId }))).status, 404);
+});
+
+test('fallback titles remain bounded and lifecycle management survives removed models', async () => {
+  const f = fixture(); await activate(f.context);
+  const first = await f.routes.get('POST /roles')(req({ name: 'A'.repeat(120), soul: '# SOUL\nFirst.' }));
+  const second = await f.routes.get('POST /roles')(req({ name: 'B'.repeat(120), soul: '# SOUL\nSecond.' }));
+  const created = await f.routes.get('POST /conversations')(req({ roleIds: [first.body.role.id, second.body.role.id], connectionId: 'local', model: 'stheno' }));
+  assert.ok(created.body.conversation.title.length <= theaterContract.MAX.name); assert.match(created.body.conversation.title, /… · .* UTC$/);
+  f.models.splice(0);
+  assert.equal((await f.routes.get('PUT /conversations/:id')(req({ title: 'Manage old transcript' }, { id: created.body.conversation.id }))).status, 200);
+  assert.equal((await f.routes.get('PUT /conversations/:id')(req({ archived: true }, { id: created.body.conversation.id }))).status, 200);
+  assert.equal((await f.routes.get('PUT /conversations/:id')(req({ archived: false }, { id: created.body.conversation.id }))).status, 200);
+});
+
+test('conversation lifecycle rejects blank titles and mutation/deletion during pending text or Forge work', async () => {
+  const f = fixture(); await activate(f.context); const created = await createConversation(f); const id = created.body.conversation.id;
+  assert.equal((await f.routes.get('PUT /conversations/:id')(req({ title: '   ' }, { id }))).status, 400);
+  await f.routes.get('POST /conversations/:id/turn')(req({ content: 'Hello' }, { id }));
+  assert.equal((await f.routes.get('PUT /conversations/:id')(req({ archived: true }, { id }))).status, 409);
+  assert.equal((await f.routes.get('DELETE /conversations/:id')(req({}, { id }))).status, 409);
+  await reconcileGeneration(f, id);
+  const stored = f.settings.get('conversations'); stored[0].messages.push({ id: 'image-pending', type: 'forge_image', role: 'assistant', status: 'pending', prompt: 'Scene' }); f.settings.set('conversations', stored);
+  assert.equal((await f.routes.get('PUT /conversations/:id')(req({ title: 'Nope' }, { id }))).status, 409);
+  assert.equal((await f.routes.get('DELETE /conversations/:id')(req({}, { id }))).status, 409);
+  assert.equal((await f.routes.get('PUT /roles/:id')(req({ name: 'Nope' }, { id: 'house-goblin' }))).status, 409);
+});
+
 test('the explicit fiction boundary excludes operational agent behavior', () => {
   assert.match(theaterContract.FICTION_BOUNDARY, /fictional roleplay conversation/); assert.match(theaterContract.FICTION_BOUNDARY, /never claim to have used tools/);
   assert.match(theaterContract.DEFAULT_ROLE.soul, /# SOUL/); assert.match(theaterContract.DEFAULT_ROLE.soul, /Stay in character/);
@@ -114,7 +173,7 @@ test('legacy conversations normalize participant arrays and historical attributi
 
 test('group turn generates ordered attributed replies with coherent cast and transcript', async () => {
   const f = await groupFixture(); const created = await groupCreate(f); const conversation = created.body.conversation;
-  assert.equal(created.status, 201); assert.equal(conversation.roleId, f.roleIds[0]); assert.equal(conversation.title, 'The House Goblin, Mara');
+  assert.equal(created.status, 201); assert.equal(conversation.roleId, f.roleIds[0]); assert.match(conversation.title, /^The House Goblin, Mara · .* UTC$/); assert.equal(conversation.titleSource, 'fallback');
   assert.equal((await f.routes.get('DELETE /roles/:id')(req({}, { id: f.roleIds[1] }))).status, 409);
   const turn = await completeTurn(f, conversation.id, 'Hello everyone');
   assert.equal(turn.status, 200); assert.deepEqual(turn.body.conversation.messages.map(m => m.role), ['user', 'assistant', 'assistant']);

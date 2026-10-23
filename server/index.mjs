@@ -6,7 +6,7 @@ const IMAGE_DIRECTIVE = Object.freeze({
   close: ' -->',
   prompt: `# Optional image direction\nYou may request one image for your reply. This is not a tool call. If an image would genuinely add to the scene, append exactly one directive on its own final line using this exact form:\n<!-- BURROW_FORGE_IMAGE {\"prompt\":\"A complete standalone image prompt\"} -->\nThe JSON must contain only the string key \"prompt\". Do not mention the directive or image generation in your prose. Omit it entirely when an image would not help.`
 });
-const MAX = Object.freeze({ name: 120, soul: 48000, message: 24000, imagePrompt: 4000, transcript: 400, outputTokens: 8192 });
+const MAX = Object.freeze({ name: 120, soul: 48000, profile: 24000, message: 24000, imagePrompt: 4000, transcript: 400, outputTokens: 8192 });
 const DEFAULT_ROLE = Object.freeze({
   id: 'house-goblin',
   name: 'The House Goblin',
@@ -59,14 +59,38 @@ function normalizeRole(role) { return { ...role, allowForgeImages: role.allowFor
 function normalizeConversation(conversation) {
   const { allowForgeImages: _legacyForgePermission, ...rest } = conversation;
   const roleIds = Array.isArray(conversation.roleIds) && conversation.roleIds.length ? conversation.roleIds : [conversation.roleId];
-  return { ...rest, roleIds, roleId: roleIds[0], messages: (conversation.messages || []).map((message) =>
-    message.role === 'assistant' && !message.roleId ? { ...message, roleId: conversation.roleId || roleIds[0] } : message) };
+  return { ...rest, roleIds, roleId: roleIds[0], archivedAt: typeof conversation.archivedAt === 'string' ? conversation.archivedAt : null,
+    titleSource: ['fallback', 'automatic', 'manual'].includes(conversation.titleSource) ? conversation.titleSource : 'manual',
+    messages: (conversation.messages || []).map((message) =>
+      message.role === 'assistant' && !message.roleId ? { ...message, roleId: conversation.roleId || roleIds[0] } : message) };
 }
 function publicConversation(conversation) {
   return { ...conversation, messages: (conversation.messages || []).map(({ generationRequest, turnSnapshot, ...message }) => message) };
 }
 function generationPending(conversation) {
   return conversation.messages.some((message) => message.type === 'text_generation' && message.status === 'pending');
+}
+function workPending(conversation) {
+  return conversation.messages.some((message) => ['text_generation', 'forge_image'].includes(message.type) && message.status === 'pending');
+}
+function validateOperatorProfile(body, existing = {}) {
+  if (!plain(body) || Object.keys(body).some((key) => !['name', 'profile'].includes(key))) fail('operator_profile_invalid');
+  return {
+    name: text(body.name ?? existing.name, 'operator_name', MAX.name, { required: true }),
+    profile: text(body.profile ?? existing.profile, 'operator_profile', MAX.profile)
+  };
+}
+function fallbackTitle(roles, timestamp) {
+  const suffix = ` · ${timestamp.replace('T', ' ').replace('Z', ' UTC')}`;
+  const cast = roles.map((role) => role?.name).filter(Boolean).join(', ') || 'New conversation';
+  if (cast.length + suffix.length <= MAX.name) return `${cast}${suffix}`;
+  const available = Math.max(1, MAX.name - suffix.length - 1);
+  return `${cast.slice(0, available).trimEnd()}…${suffix}`;
+}
+function automaticTitle(content) {
+  const normalized = String(content || '').replace(/[`*_>#~\[\]()]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.length <= 80 ? normalized : `${normalized.slice(0, 77).trimEnd()}…`;
 }
 function generationMessage({ role, generationRequest, turnSnapshot }) {
   const timestamp = now();
@@ -99,7 +123,7 @@ function projectImageJob(message, job) {
   return { ...message, status: completed ? 'completed' : pending ? 'pending' : 'failed', jobId: job?.id || message.jobId || null, previewUrl: completed ? job.artifacts.find((artifact) => artifact?.previewUrl).previewUrl : null, error: !completed && !pending ? (job?.error || 'Image generation failed.') : null, updatedAt: now() };
 }
 function validateConversation(body, existing = {}) {
-  if (!plain(body) || Object.keys(body).some((key) => !['roleId', 'roleIds', 'connectionId', 'model', 'title', 'effort', 'temperature'].includes(key))) fail('conversation_invalid');
+  if (!plain(body) || Object.keys(body).some((key) => !['roleId', 'roleIds', 'connectionId', 'model', 'title', 'effort', 'temperature', 'archived'].includes(key))) fail('conversation_invalid');
   const participants = body.roleIds !== undefined ? body.roleIds : body.roleId !== undefined ? [body.roleId] : existing.roleIds || [existing.roleId];
   if (!Array.isArray(participants) || !participants.length || participants.length >= MAX.transcript) fail('role_ids_invalid');
   const roleIds = participants.map((value) => id(value, 'role_id'));
@@ -109,11 +133,13 @@ function validateConversation(body, existing = {}) {
   if (effort != null && (typeof effort !== 'string' || !['off', 'minimal', 'low', 'medium', 'high', 'ultra', 'xhigh', 'max'].includes(effort))) fail('model_reasoning_effort_invalid');
   const temperature = body.temperature === undefined ? existing.temperature : body.temperature;
   if (temperature != null && (typeof temperature !== 'number' || !Number.isFinite(temperature) || temperature < 0 || temperature > 2)) fail('model_temperature_invalid');
+  const title = body.title === undefined ? text(existing.title, 'title', MAX.name) : text(body.title, 'title', MAX.name, { required: true });
   return {
     roleIds, roleId: roleIds[0],
     connectionId: text(body.connectionId ?? existing.connectionId, 'connection_id', 128, { required: true }),
     model: text(body.model ?? existing.model, 'model', 256, { required: true }),
-    title: text(body.title ?? existing.title, 'title', MAX.name),
+    title,
+    archivedAt: body.archived === undefined ? (existing.archivedAt || null) : body.archived === true ? (existing.archivedAt || now()) : body.archived === false ? null : fail('conversation_archived_invalid'),
     effort: effort ?? null, temperature: temperature ?? null
   };
 }
@@ -129,10 +155,12 @@ function generationControls(conversation, model) {
   }
   return controls;
 }
-function buildPrompt(role, conversation, roles) {
-  const transcript = conversation.messages.filter((message) => message.type !== 'forge_image').map((message) => `${message.role === 'user' ? 'Operator' : message.roleName || roles.find((item) => item.id === message.roleId)?.name || message.roleId || 'Role'}:\n${message.content}`).join('\n\n');
+function buildPrompt(role, conversation, roles, operatorProfile) {
+  const operatorName = operatorProfile?.name || 'You';
+  const transcript = conversation.messages.filter((message) => message.type !== 'forge_image').map((message) => `${message.role === 'user' ? operatorName : message.roleName || roles.find((item) => item.id === message.roleId)?.name || message.roleId || 'Role'}:\n${message.content}`).join('\n\n');
   const cast = conversation.roleIds.map((roleId) => roles.find((item) => item.id === roleId)?.name || roleId).join(', ');
-  return [role.soul, `# Theater boundary\n${FICTION_BOUNDARY}`, role.allowForgeImages ? IMAGE_DIRECTIVE.prompt : '', `# Participants\n${cast}\nReply only as ${role.name}.`, '# Conversation', transcript, `${role.name}:`].filter(Boolean).join('\n\n');
+  const player = [`Name: ${operatorName}`, operatorProfile?.profile || ''].filter(Boolean).join('\n\n');
+  return [role.soul, `# Theater boundary\n${FICTION_BOUNDARY}`, role.allowForgeImages ? IMAGE_DIRECTIVE.prompt : '', `# Player\n${player}`, `# Participants\n${cast}\nReply only as ${role.name}.`, '# Conversation', transcript, `${role.name}:`].filter(Boolean).join('\n\n');
 }
 
 export async function activate(context) {
@@ -148,6 +176,19 @@ export async function activate(context) {
   };
   const saveRoles = (items) => context.settings.set('roles', items);
   const saveConversations = (items) => context.settings.set('conversations', items);
+  const coreOperatorIdentity = async () => {
+    try {
+      const identity = await context.operator?.displayIdentity?.();
+      return identity?.name ? identity.name : 'You';
+    } catch { return 'You'; }
+  };
+  const readOperatorProfile = async () => {
+    const stored = await context.settings.get('operatorProfile', null);
+    if (plain(stored)) {
+      try { return validateOperatorProfile(stored); } catch { /* Invalid legacy state falls back without bricking Theater. */ }
+    }
+    return { name: await coreOperatorIdentity(), profile: '' };
+  };
   const route = (handler) => async (request) => { try { requireOperator(request); return await handler(request); } catch (error) { return errorResponse(error, context.logger); } };
   const validateSelection = async (values, body = {}, existing = {}) => {
     const roles = await readRoles();
@@ -164,19 +205,18 @@ export async function activate(context) {
   };
 
   context.api.get('/bootstrap', route(async () => {
-    let operator = { name: 'You', avatar: '' };
-    if (context.operator?.displayIdentity) {
-      try {
-        const identity = await context.operator.displayIdentity();
-        if (identity?.name) operator = { name: identity.name, avatar: '' };
-      } catch {
-        // Operator display identity is optional; chat still works without it.
-      }
-    }
+    const operatorProfile = await readOperatorProfile();
+    const operator = { name: operatorProfile.name, avatar: '' };
     let forgeImages = { available: false, reason: 'Forge images are unavailable.' };
     try { forgeImages = await context.forge.images.status(); } catch { /* Optional capability: Theater remains usable without it. */ }
-    return response(200, { ok: true, boundary: FICTION_BOUNDARY, operator, forgeImages, models: await context.models.list(), roles: await readRoles(), conversations: (await readConversations()).map(publicConversation) });
+    return response(200, { ok: true, boundary: FICTION_BOUNDARY, operator, operatorProfile, forgeImages, models: await context.models.list(), roles: await readRoles(), conversations: (await readConversations()).map(publicConversation) });
   }));
+
+  context.api.put('/operator-profile', route(async ({ body }) => serial(async () => {
+    const profile = validateOperatorProfile(body, await readOperatorProfile());
+    await context.settings.set('operatorProfile', profile);
+    return response(200, { ok: true, operatorProfile: profile });
+  })));
 
   context.api.post('/roles', route(async ({ body }) => serial(async () => {
     const timestamp = now();
@@ -187,7 +227,7 @@ export async function activate(context) {
   context.api.put('/roles/:id', route(async ({ params, body }) => serial(async () => {
     const roleId = id(params.id); const roles = await readRoles(); const index = roles.findIndex((item) => item.id === roleId);
     if (index < 0) fail('role_not_found', 404);
-    if ((await readConversations()).some((item) => item.roleIds.includes(roleId) && generationPending(item))) fail('conversation_turn_in_progress', 409);
+    if ((await readConversations()).some((item) => item.roleIds.includes(roleId) && workPending(item))) fail('conversation_turn_in_progress', 409);
     roles[index] = { ...roles[index], ...validateRole(body, roles[index]), updatedAt: now() }; await saveRoles(roles);
     return response(200, { ok: true, role: roles[index] });
   })));
@@ -203,8 +243,9 @@ export async function activate(context) {
     const values = validateConversation(body); const roles = await validateSelection(values, body);
     const role = roles.find((item) => item.id === values.roleId);
     const timestamp = now();
-    const defaultTitle = values.roleIds.map((roleId) => roles.find((item) => item.id === roleId)?.name).filter(Boolean).join(', ');
-    const conversation = { id: randomUUID(), ...values, title: values.title || defaultTitle || role.name, messages: [], createdAt: timestamp, updatedAt: timestamp };
+    const selectedRoles = values.roleIds.map((roleId) => roles.find((item) => item.id === roleId));
+    const conversation = { id: randomUUID(), ...values, title: values.title || fallbackTitle(selectedRoles, timestamp),
+      titleSource: values.title ? 'manual' : 'fallback', archivedAt: null, messages: [], createdAt: timestamp, updatedAt: timestamp };
     const conversations = await readConversations(); conversations.unshift(conversation); await saveConversations(conversations);
     return response(201, { ok: true, conversation: publicConversation(conversation) });
   })));
@@ -212,11 +253,21 @@ export async function activate(context) {
     const conversationId = id(params.id); const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
     if (index < 0) fail('conversation_not_found', 404);
     const values = validateConversation(body, conversations[index]);
-    await validateSelection(values, body, conversations[index]);
-    if (generationPending(conversations[index])) fail('conversation_turn_in_progress', 409);
-    conversations[index] = { ...conversations[index], ...values, title: values.title || conversations[index].title, updatedAt: now() };
+    if (workPending(conversations[index])) fail('conversation_turn_in_progress', 409);
+    const lifecycleOnly = Object.keys(body).every((key) => ['title', 'archived'].includes(key));
+    if (!lifecycleOnly) await validateSelection(values, body, conversations[index]);
+    const titleChanged = body.title !== undefined && values.title;
+    conversations[index] = { ...conversations[index], ...values, title: values.title || conversations[index].title,
+      titleSource: titleChanged ? 'manual' : conversations[index].titleSource, updatedAt: now() };
     await saveConversations(conversations);
     return response(200, { ok: true, conversation: publicConversation(conversations[index]) });
+  })));
+  context.api.delete('/conversations/:id', route(async ({ params }) => serial(async () => {
+    const conversationId = id(params.id); const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
+    if (index < 0) fail('conversation_not_found', 404);
+    if (workPending(conversations[index])) fail('conversation_turn_in_progress', 409);
+    conversations.splice(index, 1); await saveConversations(conversations);
+    return response(200, { ok: true });
   })));
   context.api.post('/conversations/:id/turn', route(async ({ params, body }) => serial(async () => {
     const conversationId = id(params.id);
@@ -227,6 +278,7 @@ export async function activate(context) {
     const conversations = await readConversations(); const index = conversations.findIndex((item) => item.id === conversationId);
     if (index < 0) fail('conversation_not_found', 404);
     const conversation = clone(conversations[index]);
+    if (conversation.archivedAt) fail('conversation_archived', 409);
     if (generationPending(conversation)) fail('conversation_turn_in_progress', 409);
     const roles = await readRoles();
     const selectedRoles = conversation.roleIds.map((roleId) => roles.find((item) => item.id === roleId));
@@ -236,13 +288,18 @@ export async function activate(context) {
     const model = (await context.models.list()).find((item) => item.connectionId === conversation.connectionId && item.model === conversation.model);
     if (!model) fail('model_not_found', 404);
     const controls = generationControls(conversation, model);
+    const operatorProfile = await readOperatorProfile();
+    if (conversation.titleSource === 'fallback' && !conversation.messages.some((message) => message.role === 'user')) {
+      const derived = automaticTitle(content);
+      if (derived) { conversation.title = derived; conversation.titleSource = 'automatic'; }
+    }
     conversation.messages.push({ id: randomUUID(), role: 'user', content, createdAt: now() });
     const firstRole = selectedRoles[0];
     const turnSnapshot = { roles: selectedRoles.map(clone), nextRoleIndex: 1, completedMessages: [], connectionId: conversation.connectionId,
-      model: conversation.model, maxTokens, controls: clone(controls) };
+      model: conversation.model, maxTokens, controls: clone(controls), operatorProfile: clone(operatorProfile) };
     conversation.messages.push(generationMessage({ role: firstRole,
       generationRequest: { connectionId: conversation.connectionId, model: conversation.model,
-        prompt: buildPrompt(firstRole, conversation, selectedRoles), maxTokens, ...controls }, turnSnapshot }));
+        prompt: buildPrompt(firstRole, conversation, selectedRoles, operatorProfile), maxTokens, ...controls }, turnSnapshot }));
     conversation.updatedAt = now(); conversations[index] = conversation; await saveConversations(conversations);
     return response(202, { ok: true, conversation: publicConversation(conversation) });
   })));
@@ -287,7 +344,7 @@ export async function activate(context) {
             const nextSnapshot = { ...snapshot, nextRoleIndex: snapshot.nextRoleIndex + 1, completedMessages };
             const nextMessage = generationMessage({ role: nextRole,
               generationRequest: { connectionId: snapshot.connectionId, model: snapshot.model,
-                prompt: buildPrompt(nextRole, promptConversation, snapshot.roles), maxTokens: snapshot.maxTokens, ...snapshot.controls },
+                prompt: buildPrompt(nextRole, promptConversation, snapshot.roles, snapshot.operatorProfile), maxTokens: snapshot.maxTokens, ...snapshot.controls },
               turnSnapshot: nextSnapshot });
             conversations[index].messages.splice(messageIndex, 1, nextMessage);
           } else {

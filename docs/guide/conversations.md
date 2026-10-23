@@ -6,6 +6,8 @@ Choose a role in the **Roles** rail, then use the conversation selector. The sel
 
 Switching roles or conversations clears an unsent composer draft. Send or copy it first if you need to keep it.
 
+Use **Rename**, **Archive**, and **Delete** beside the conversation selector to manage a transcript. Archived conversations remain available in the selector and are clearly marked; Theater never silently expires them. Restore an archived conversation to return it to active status. Delete permanently removes the transcript after confirmation. Lifecycle actions are disabled while text or Forge image work is pending.
+
 ## Choose a model
 
 The toolbar exposes **Provider**, **Model**, **Effort**, and **Temp**.
@@ -29,10 +31,15 @@ Each selected role answers once per operator message, in participant order. Gene
 
 A group therefore makes one text-generation request per role per turn. A larger cast can take longer and consume more provider usage than a single-role conversation. Your message appears immediately while the group writes. Role replies arrive after the complete text turn; they are not streamed one by one.
 
+## Theater operator profile
+
+Open **Settings → Theater → Operator profile** to choose the preferred name and optional Markdown/context that Theater roles receive about you. This profile is Theater-specific: it does not change your normal Burrow identity or any agent profile. Your preferred name is also used to attribute your Theater messages.
+
 ## What each role receives
 
 - Its own current SOUL.
 - Theater’s fiction boundary.
+- Your Theater-specific operator name and profile/context.
 - Names of the participants and an instruction to reply as itself.
 - The conversation’s text, including earlier replies from the current group turn.
 - Optional image-direction instructions when that role’s Forge images setting is enabled.

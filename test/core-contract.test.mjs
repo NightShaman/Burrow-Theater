@@ -27,8 +27,9 @@ test('current Burrow Core discovers and hosts Burrow Theater with durable model 
   const [mod] = await discoverMods({ runtimeRoot, logger: { warn() {} } });
   assert.equal(mod.id, 'burrow-theater'); assert.equal(mod.name, 'Theater'); assert.notEqual(mod.status, 'failed', mod.error);
   assert.deepEqual(Object.keys(mod.ui), ['control', 'settings']);
-  assert.equal(mod.contributions.settings[0].id, 'roles');
+  assert.deepEqual(mod.contributions.settings.map(item => item.id), ['profile', 'roles']);
   assert.equal(mod.contributions.settings[0].primary.capability, 'settingsUi');
+  assert.equal(mod.contributions.settings[1].primary.capability, 'settingsUi');
 
   const generations = [], jobs = new Map(), forgeCalls = [];
   const host = startModHost({ mod, store: await memoryStore(), logger: { debug() {}, info() {}, warn() {}, error() {} }, capabilities: {

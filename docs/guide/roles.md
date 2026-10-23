@@ -35,7 +35,7 @@ The image setting is off by default and follows the role across its conversation
 
 ## Remove a role
 
-The delete button asks for confirmation. A role still referenced by any conversation cannot be deleted. This snapshot has no conversation-deletion control, so do not expect to free an in-use role through the Theater interface yet.
+The delete button asks for confirmation. A role still referenced by any active or archived conversation cannot be deleted. In Theater Main, select each conversation that uses the role and choose **Delete**. After those transcripts are permanently removed, return to **Settings → Theater → Roles** and delete the role.
 
 ## Limits
 
