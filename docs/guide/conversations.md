@@ -6,7 +6,7 @@ Choose a role in the **Roles** rail, then use the conversation selector. The sel
 
 Switching roles or conversations clears an unsent composer draft. Send or copy it first if you need to keep it.
 
-Use **Rename**, **Archive**, and **Delete** beside the conversation selector to manage a transcript. Archived conversations remain available in the selector and are clearly marked; Theater never silently expires them. Restore an archived conversation to return it to active status. Delete permanently removes the transcript after confirmation. Lifecycle actions are disabled while text or Forge image work is pending.
+Use **Rename**, **Archive**, and **Delete** beside the conversation selector to manage a transcript. Archived conversations remain available in the selector and are clearly marked; Theater never silently expires them. Choose **Restore** before sending another message in an archived conversation. Delete permanently removes the transcript after confirmation. Lifecycle actions are disabled while text or Forge image work is pending. New conversations receive a cast-and-time fallback title; the first submitted message supplies an automatic title unless you have named the conversation yourself.
 
 ## Choose a model
 
@@ -33,7 +33,7 @@ A group therefore makes one text-generation request per role per turn. A larger 
 
 ## Theater operator profile
 
-Open **Settings → Theater → Operator profile** to choose the preferred name and optional Markdown/context that Theater roles receive about you. This profile is Theater-specific: it does not change your normal Burrow identity or any agent profile. Your preferred name is also used to attribute your Theater messages.
+Open **Settings → Theater → Operator profile** to choose the preferred name and optional Markdown/context that Theater roles receive about you. This profile is Theater-specific: it does not change your normal Burrow identity or any agent profile. Your preferred name is also used to attribute your Theater messages. The name is required (up to 120 characters); profile/context is optional (up to 24,000). The profile is copied into the submitted turn’s snapshot, so edits do not rewrite an already pending turn.
 
 ## What each role receives
 
@@ -48,11 +48,14 @@ There is no Brains retrieval, agent tool execution, workspace loading, or automa
 
 ## Saving and failed turns
 
-Conversations persist in Theater’s Core-managed settings. A successful text turn is committed together. If a role generation fails, Theater does not save a partial group turn. Provider requests already made may still count toward usage.
+Conversations persist in Theater’s Core-managed settings. Submitting a turn saves your message and a pending text-generation record, then returns without waiting for the model. The active view reconciles it through Core’s durable generation jobs (about every 1.8 seconds while work is pending). Reopening/selecting a pending conversation resumes reconciliation; closing the view is not cancellation.
 
-If another request changes the conversation or participating role during generation, Theater rejects the stale turn instead of overwriting newer state. On failure, the temporary operator message is removed. The submitted text returns to an empty composer; if you have already started another draft, that newer draft is preserved instead. Copy anything important before navigating away.
+Group roles are generated sequentially, but their replies become visible together only after every participant succeeds. A later role failure does not publish a partial cast reply. The saved user message and a failed-generation card remain; provider requests already made may still count toward usage. There is no dedicated retry button for a failed text generation.
+
+A request failure before the UI receives a successful submission response removes only its temporary optimistic message and restores the submitted text if the composer is empty; a newer draft is preserved. That is different from an accepted turn that later fails during generation. Reopen the conversation and inspect its saved state before resending after an uncertain response. Copy anything important before navigating away.
 
 You can type your next message while a reply is being generated, but cannot send it until the active turn finishes. Role replies render a supported Markdown subset, including emphasis, lists, headings, links, quotations, and code blocks. Operator messages remain plain text. Raw HTML is ignored, and Markdown image syntax does not load remote images; scene illustrations use Forge cards.
 
 At the transcript limit, start a new session. That creates a fresh transcript; it does not automatically carry forward the old story. See [limits](troubleshooting.md#conversation-limits).
+
 

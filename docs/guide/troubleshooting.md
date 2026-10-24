@@ -20,7 +20,7 @@ The selected model has not advertised support for that control. This is expected
 
 ## A reply failed or the conversation changed
 
-A failed group turn is not partially saved. The submitted message is restored if the composer is empty; a newer draft is preserved if you have already typed one. Check the current conversation and roles before resending.
+Group assistant replies are published together only after all roles succeed. If an accepted generation later fails, the saved operator message and failed-generation card remain. A failure of the initial send request instead restores the composer text when it is empty. Reopen the conversation and inspect saved state before resending an uncertain request. For a pending card, return to that conversation to resume reconciliation and check Core’s durable generation support; there is no dedicated retry/cancel control.
 
 The generic `internal_error` response deliberately does not include the internal exception. Theater logs server errors as **Burrow Theater request failed**. Image reconciliation warnings use **Burrow Theater could not reconcile Forge image job**. Consult the host’s available logs; this mod does not supply a dedicated log viewer.
 
@@ -41,15 +41,16 @@ The provider’s own context window and limits still apply. Theater does not sum
 
 ## Deleting an in-use role
 
-The role is protected while a conversation references it. Although the current error text suggests deleting those conversations first, this snapshot does not expose a conversation-deletion route or control. Do not edit stored settings by hand as a documented workaround.
+The role is protected while any active or archived conversation references it. Select those conversations in Theater and use **Delete**, confirming the permanent transcript removal, before deleting the role in Settings. Wait for pending text or Forge image work before lifecycle actions; archiving alone does not free the role.
 
 ## Features not present in this snapshot
 
-There is no conversation export, branching, regenerate button, message editing, conversation deletion, or character-avatar editor. The current UI creates a cast for a new group; it does not offer a participant editor for an existing conversation.
+There is no conversation export, branching, regenerate button, message editing, or character-avatar editor. The current UI creates a cast for a new group; it does not offer a participant editor for an existing conversation.
 
 ## Data handling
 
-Roles and conversations live in Theater’s Core-managed settings namespace. They are distinct from agent sessions and Brains, but there is no Theater-specific encryption or per-conversation isolation policy in this implementation.
+Roles, conversations and the Theater-specific operator profile live in Theater’s Core-managed settings namespace. They are distinct from agent sessions and Brains, but there is no Theater-specific encryption or per-conversation isolation policy in this implementation.
 
 Selected providers receive conversation text for generation. Forge receives requested image prompts. Treat model/provider selection and access to the Burrow installation as part of your data-handling decision.
+
 

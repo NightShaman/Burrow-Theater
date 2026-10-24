@@ -19,10 +19,11 @@ The role is defined with the same SOUL-style Markdown used by Burrow agents. The
 ## Current experience
 
 - Familiar Burrow-style chat and composer
-- Reusable SOUL roles managed through Burrow Settings
+- Reusable SOUL roles and a Theater-specific operator profile managed through Burrow Settings
+- Rename, archive/restore and permanently delete conversations when no work is pending
 - Optional Forge images enabled independently for each role when Core has an image model available
 - Configured model selection, including local text-only models
-- Persistent isolated conversations with immediate operator-message feedback while replies generate
+- Persistent conversations with immediate operator-message feedback and Core-backed durable text-generation reconciliation
 - Explicit fiction boundary with no operational agent behavior
 - Responsive desktop and mobile layouts
 
@@ -46,3 +47,4 @@ Install through **Settings → Mods → Mod sources**:
 3. Explicitly enable the mod.
 
 Burrow Theater is distributed under the [Burrow Sustainable Use License](LICENSE).
+
